@@ -7,7 +7,7 @@ import os
 import argparse
 from lib.models.decode import XcodeYtimeDecoder, MuStdModel
 from lib.models.revin import RevIN
-from lib.models.metrics import pearsoncor
+from lib.models.metrics import dtw, pearsoncor
 from lib.utils.checkpoint import EarlyStopping
 from lib.utils.env import seed_all_rng
 
@@ -385,7 +385,7 @@ def train(args):
         if val_dataloader is not None:
             model_decode.eval()
             model_mustd.eval()
-            running_mse, running_mae, running_cor = 0.0, 0.0, 0.0
+            running_mse, running_mae, running_cor, running_dtw = 0.0, 0.0, 0.0, 0.0
             total_num, total_num_c = 0.0, 0.0
             # Disable gradient computation and reduce memory consumption.
             with torch.no_grad():
@@ -408,16 +408,18 @@ def train(args):
                     running_mse += F.mse_loss(pred_time, labels_time, reduction="sum")
                     running_mae += (pred_time - labels_time).abs().sum()
                     running_cor += pearsoncor(pred_time, labels_time, reduction="sum")
+                    running_dtw += dtw(pred_time, labels_time, reduction="sum")
                     total_num += labels_time.numel()  # B * S * T
                     total_num_c += labels_time.shape[0] * labels_time.shape[2]  # B * S
             running_mae = running_mae / total_num
             running_mse = running_mse / total_num
             running_cor = running_cor / total_num_c
+            running_dtw = running_dtw / total_num_c
             print(
-                f"| [Val] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f}"
+                f"| [Val] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f} dtw {running_dtw:5.4f}"
             )
 
-            save_file.write(f"| [Val] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f}\n")
+            save_file.write(f"| [Val] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f} dtw {running_dtw:5.4f}\n")
 
             early_stopping_counter = early_stopping(running_mse, running_mae, {"decode": model_decode, "mustd": model_mustd})
 
@@ -425,7 +427,7 @@ def train(args):
         if test_dataloader is not None:
             model_decode.eval()
             model_mustd.eval()
-            running_mse, running_mae, running_cor = 0.0, 0.0, 0.0
+            running_mse, running_mae, running_cor, running_dtw = 0.0, 0.0, 0.0, 0.0
             total_num, total_num_c = 0.0, 0.0
             # Disable gradient computation and reduce memory consumption.
             with torch.no_grad():
@@ -451,6 +453,7 @@ def train(args):
                     running_mse += F.mse_loss(pred_time, labels_time, reduction="sum")
                     running_mae += (pred_time - labels_time).abs().sum()
                     running_cor += pearsoncor(pred_time, labels_time, reduction="sum")
+                    running_dtw += dtw(pred_time, labels_time, reduction="sum")
                     total_num += labels_time.numel()
                     total_num_c += labels_time.shape[0] * labels_time.shape[2]  # B * S
 
@@ -459,10 +462,11 @@ def train(args):
             running_mae = running_mae / total_num
             running_mse = running_mse / total_num
             running_cor = running_cor / total_num_c
+            running_dtw = running_dtw / total_num_c
             print(
-                f"| [Test] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f}"
+                f"| [Test] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f} dtw {running_dtw:5.4f}"
             )
-            save_file.write(f"| [Test] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f}\n")
+            save_file.write(f"| [Test] mse {running_mse:5.4f} mae {running_mae:5.4f} corr {running_cor:5.4f} dtw {running_dtw:5.4f}\n")
             save_file.write(f"Early stopping counter is: {early_stopping_counter}\n")
 
         if early_stopping.early_stop:
@@ -513,6 +517,11 @@ def get_params(data_type, data_path):
     elif data_type == "all":
         batchsize = 4096
         Sin = Sout = 1
+        dataroot = data_path
+
+    elif data_type == "abiomed":
+        batchsize = 128
+        Sin = Sout = 12
         dataroot = data_path
 
     else:

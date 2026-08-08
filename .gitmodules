@@ -1,0 +1,3 @@
+[submodule "chronos-forecasting"]
+	path = chronos-forecasting
+	url = git@github.com:aysintumay/chronos-forecasting.git

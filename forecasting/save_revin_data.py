@@ -141,6 +141,8 @@ if __name__ == '__main__':
         pass
     elif 'ETT' in args.data and args.enc_in == 7:
         pass
+    elif args.data == 'abiomed' and args.enc_in == 12:
+        pass
     else:
         pdb.set_trace()
 

@@ -45,3 +45,41 @@ CVS
 Backup[ ]of[ ]*.pages/
 Backup[ ]of[ ]*.key/
 Backup[ ]of[ ]*.numbers
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model checkpoints / weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.h5
+*.pkl
+*.joblib
+
+# Large data arrays / datasets
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.parquet
+
+# Generated images and figures
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Env / venv directories
+*.egg-info/
+
+# Project-specific large/generated dirs
+forecasting/data/
+forecasting/data_raw/
+forecasting/saved_models/
+forecasting/results/
+forecasting/results_llm/
+figures/

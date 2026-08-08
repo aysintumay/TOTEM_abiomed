@@ -11,6 +11,7 @@ data_dict = {
     'custom': Dataset_Custom,
     'neuro': Dataset_Neuro,
     'saugeen_web': Dataset_Saugeen_Web,
+    'abiomed': Dataset_Neuro,
 }
 
 

@@ -39,7 +39,23 @@ class ResidualStack(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens, embedding_dim, compression_factor):
         super(Encoder, self).__init__()
-        if compression_factor == 4:
+        if compression_factor == 2:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=4,
+                                     stride=2, padding=1)
+            self._conv_3 = nn.Conv1d(in_channels=num_hiddens,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                 num_hiddens=num_hiddens,
+                                                 num_residual_layers=num_residual_layers,
+                                                 num_residual_hiddens=num_residual_hiddens)
+
+            self._pre_vq_conv = nn.Conv1d(in_channels=num_hiddens, out_channels=embedding_dim, kernel_size=1, stride=1)
+
+        elif compression_factor == 4:
             self._conv_1 = nn.Conv1d(in_channels=in_channels,
                                      out_channels=num_hiddens // 2,
                                      kernel_size=4,
@@ -136,7 +152,18 @@ class Encoder(nn.Module):
             self._pre_vq_conv = nn.Conv1d(in_channels=num_hiddens, out_channels=embedding_dim, kernel_size=1, stride=1)
 
     def forward(self, inputs, compression_factor):
-        if compression_factor == 4:
+        if compression_factor == 2:
+            x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
+
+            x = self._conv_1(x)
+            x = F.relu(x)
+
+            x = self._conv_3(x)
+            x = self._residual_stack(x)
+            x = self._pre_vq_conv(x)
+            return x
+
+        elif compression_factor == 4:
             x = inputs.view([inputs.shape[0], 1, inputs.shape[-1]])
 
             x = self._conv_1(x)
@@ -208,7 +235,23 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens, compression_factor):
         super(Decoder, self).__init__()
-        if compression_factor == 4:
+        if compression_factor == 2:
+            self._conv_1 = nn.Conv1d(in_channels=in_channels,
+                                     out_channels=num_hiddens,
+                                     kernel_size=3,
+                                     stride=1, padding=1)
+
+            self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                                 num_hiddens=num_hiddens,
+                                                 num_residual_layers=num_residual_layers,
+                                                 num_residual_hiddens=num_residual_hiddens)
+
+            self._conv_trans_2 = nn.ConvTranspose1d(in_channels=num_hiddens,
+                                                    out_channels=1,
+                                                    kernel_size=4,
+                                                    stride=2, padding=1)
+
+        elif compression_factor == 4:
             self._conv_1 = nn.Conv1d(in_channels=in_channels,
                                      out_channels=num_hiddens,
                                      kernel_size=3,
@@ -314,7 +357,16 @@ class Decoder(nn.Module):
                                                     stride=2, padding=1)
 
     def forward(self, inputs, compression_factor):
-        if compression_factor == 4:
+        if compression_factor == 2:
+            x = self._conv_1(inputs)
+
+            x = self._residual_stack(x)
+
+            x = self._conv_trans_2(x)
+
+            return torch.squeeze(x)
+
+        elif compression_factor == 4:
             x = self._conv_1(inputs)
 
             x = self._residual_stack(x)

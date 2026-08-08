@@ -100,7 +100,7 @@ def train_model(model, device, vqvae_config, save_dir, logger, args):
     start_time = time.time()
 
     print('BATCHSIZE:', args.batchsize)
-    train_loader, vali_loader, test_loader = create_datloaders(batchsize=args.batchsize, dataset=vqvae_config["dataset"], base_path=args.base_path)
+    train_loader, vali_loader, test_loader = create_datloaders(batchsize=args.batchsize, dataset=vqvae_config["dataset"], base_path=args.base_path, num_workers=args.num_workers)
 
     # do + 0.5 to ciel it
     for epoch in range(int((vqvae_config['num_training_updates']/len(train_loader)) + 0.5)):
@@ -131,7 +131,7 @@ def train_model(model, device, vqvae_config, save_dir, logger, args):
     return model
 
 
-def create_datloaders(batchsize=100, dataset="dummy", base_path='dummy'):
+def create_datloaders(batchsize=100, dataset="dummy", base_path='dummy', num_workers=10):
 
     if dataset == 'weather':
         print('weather')
@@ -165,6 +165,18 @@ def create_datloaders(batchsize=100, dataset="dummy", base_path='dummy'):
         print('all')
         full_path = base_path + '/all'
 
+    elif dataset == 'abiomed':
+        print('abiomed')
+        full_path = base_path + '/abiomed'
+
+    elif dataset == 'all_mcs':
+        print('all_mcs')
+        full_path = base_path + '/all_mcs'
+
+    elif dataset == 'ETTh1_Tin6':
+        print('ETTh1_Tin6')
+        full_path = base_path + '/ETTh1_Tin6'
+
     else:
         print('Not done yet')
         pdb.set_trace()
@@ -177,19 +189,19 @@ def create_datloaders(batchsize=100, dataset="dummy", base_path='dummy'):
     train_dataloader = torch.utils.data.DataLoader(train_data,
                                                    batch_size=batchsize,
                                                    shuffle=True,
-                                                   num_workers=10,
+                                                   num_workers=num_workers,
                                                    drop_last=True)
 
     val_dataloader = torch.utils.data.DataLoader(val_data,
                                                 batch_size=batchsize,
                                                 shuffle=False,
-                                                num_workers=10,
+                                                num_workers=num_workers,
                                                 drop_last=False)
 
     test_dataloader = torch.utils.data.DataLoader(test_data,
                                                 batch_size=batchsize,
                                                 shuffle=False,
-                                                num_workers=10,
+                                                num_workers=num_workers,
                                                 drop_last=False)
 
     return train_dataloader, val_dataloader, test_dataloader
@@ -224,6 +236,9 @@ if __name__ == '__main__':
     parser.add_argument('--batchsize', type=int,
                         required=True,
                         help='batchsize')
+    parser.add_argument('--num_workers', type=int,
+                        default=10,
+                        help='dataloader worker processes')
 
     args = parser.parse_args()
 
@@ -254,12 +269,19 @@ if __name__ == '__main__':
 
     # Setting up the comet logger
     if args.comet_log:
-        # Create an experiment with your api key
-        comet_logger = comet_ml.Experiment(
-            api_key=config['comet_config']['api_key'],
-            project_name=config['comet_config']['project_name'],
-            workspace=config['comet_config']['workspace'],
-        )
+        if config['comet_config']['api_key'] == 'add yours here':
+            # No real comet account configured - log locally instead of to comet's cloud.
+            os.makedirs(os.path.join(save_dir, 'comet_offline'), exist_ok=True)
+            comet_logger = comet_ml.OfflineExperiment(
+                offline_directory=os.path.join(save_dir, 'comet_offline'),
+            )
+        else:
+            # Create an experiment with your api key
+            comet_logger = comet_ml.Experiment(
+                api_key=config['comet_config']['api_key'],
+                project_name=config['comet_config']['project_name'],
+                workspace=config['comet_config']['workspace'],
+            )
         comet_logger.add_tag(args.comet_tag)
         comet_logger.set_name(args.comet_name)
     else:
