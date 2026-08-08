@@ -77,9 +77,23 @@ __pycache__/
 *.egg-info/
 
 # Project-specific large/generated dirs
-forecasting/data/
+forecasting/data/*
 forecasting/data_raw/
-forecasting/saved_models/
+forecasting/saved_models/*
 forecasting/results/
-forecasting/results_llm/
+forecasting/results_llm/*
 figures/
+
+# Keep the GORMPO MedLlama-8B/MCS tokenizer + token + log artifacts tracked
+# (needed to resume this pipeline on another server). "dir/*" above (rather
+# than "dir/") is required for these negations to actually re-include nested
+# files -- a bare "dir/" excludes the directory itself and git won't
+# traverse into it at all, so per-file "!" rules below it would be silently
+# ignored. These also override the *.pth/*.npy extension excludes above,
+# since the last matching pattern in the file wins.
+!forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000/
+!forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000/**
+!forecasting/data/gormpo_tokens_mcs_scratch_long2000/
+!forecasting/data/gormpo_tokens_mcs_scratch_long2000/**
+!forecasting/results_llm/gormpo_mcs_scratch_long2000/
+!forecasting/results_llm/gormpo_mcs_scratch_long2000/gormpo_llm_2021.txt
