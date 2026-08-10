@@ -99,6 +99,7 @@ class GormpoFewShotWorldModel:
         temperature: float = 0.8,
         device: str = "auto",
         load_in_4bit: bool = False,
+        lora_adapter_path: str = None,
     ):
         self.forecast_horizon = forecast_horizon
         self.k_shot = k_shot
@@ -140,6 +141,12 @@ class GormpoFewShotWorldModel:
 
         print(f"Loading model: {model_id}")
         self.llm = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+
+        if lora_adapter_path:
+            print(f"Loading LoRA adapter: {lora_adapter_path}")
+            from peft import PeftModel
+            self.llm.model = PeftModel.from_pretrained(self.llm.model, lora_adapter_path).merge_and_unload()
+
         self.llm.eval()
         self.gormpo_tokenizer.to(self.llm.device)
         print("Model ready.")

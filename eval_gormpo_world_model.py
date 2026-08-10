@@ -28,6 +28,7 @@ def main(args):
         k_shot=args.k_shot,
         num_samples=args.num_samples,
         device=args.device,
+        lora_adapter_path=args.lora_adapter_path,
     )
     model.load_data(args.data_path)
 
@@ -105,5 +106,7 @@ if __name__ == "__main__":
     parser.add_argument("--random_sample", action="store_true", help="draw num_examples uniformly at random instead of the first N")
     parser.add_argument("--random_seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--lora_adapter_path", type=str, default=None,
+                         help="Optional PEFT adapter dir (from export_gormpo_llm_adapter.py) to merge into the backbone before generation.")
     args = parser.parse_args()
     main(args)
