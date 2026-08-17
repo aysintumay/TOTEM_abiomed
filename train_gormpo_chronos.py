@@ -129,11 +129,19 @@ def main(args):
         num_workers=args.num_workers, drop_last=False,
     )
 
-    print(f"Loading pretrained Chronos backbone: {args.model_id}")
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_id)
-    model.resize_token_embeddings(tokenizer.vocab_size)
-    model.config.pad_token_id = model.generation_config.pad_token_id = chronos_config.pad_token_id
-    model.config.eos_token_id = model.generation_config.eos_token_id = chronos_config.eos_token_id
+    if args.resume_from_checkpoint:
+        # Weights only -- optimizer state (Adam momentum/variance) isn't persisted by
+        # save_pretrained, so this is a warm-started fresh optimizer, not a byte-exact
+        # continuation. Vocab is already the combined GORMPO vocab in this checkpoint,
+        # so no resize_token_embeddings/pad/eos setup needed (already baked in).
+        print(f"Resuming weights from: {args.resume_from_checkpoint}")
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.resume_from_checkpoint)
+    else:
+        print(f"Loading pretrained Chronos backbone: {args.model_id}")
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_id)
+        model.resize_token_embeddings(tokenizer.vocab_size)
+        model.config.pad_token_id = model.generation_config.pad_token_id = chronos_config.pad_token_id
+        model.config.eos_token_id = model.generation_config.eos_token_id = chronos_config.eos_token_id
     model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -142,15 +150,17 @@ def main(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     start_time = time.time()
-    for epoch in range(args.num_epochs):
+    for i in range(args.num_epochs):
+        epoch = args.epoch_offset + i
+        last = i == args.num_epochs - 1
         train_loss, _ = run_epoch(model, tokenizer, train_loader, device, optimizer, args.grad_clip)
         print(f"| epoch {epoch:3d} | train loss {train_loss:.4f}")
 
-        if epoch % args.val_every == 0 or epoch == args.num_epochs - 1:
+        if epoch % args.val_every == 0 or last:
             val_loss, _ = run_epoch(model, tokenizer, val_loader, device, optimizer=None)
             print(f"| [Val] epoch {epoch:3d} | loss {val_loss:.4f}")
 
-        if epoch % args.save_every == 0 or epoch == args.num_epochs - 1:
+        if epoch % args.save_every == 0 or last:
             model.save_pretrained(os.path.join(args.save_path, "checkpoints", f"epoch_{epoch}"))
 
     model.save_pretrained(os.path.join(args.save_path, "checkpoints", "final"))
@@ -195,7 +205,13 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=16,
                          help="episodes per batch; actual model batch is batch_size * num_channels rows")
-    parser.add_argument("--num_epochs", type=int, default=30)
+    parser.add_argument("--num_epochs", type=int, default=30, help="epochs THIS run does, not a cumulative total")
+    parser.add_argument("--resume_from_checkpoint", type=str, default="",
+                         help="dir with a save_pretrained() checkpoint to warm-start weights from "
+                              "(optimizer state is not preserved -- fresh AdamW moments)")
+    parser.add_argument("--epoch_offset", type=int, default=0,
+                         help="starting epoch number for logging/checkpoint naming, e.g. 30 when "
+                              "continuing after a prior 30-epoch run")
     parser.add_argument("--val_every", type=int, default=2)
     parser.add_argument("--save_every", type=int, default=5)
     parser.add_argument("--num_workers", type=int, default=4)

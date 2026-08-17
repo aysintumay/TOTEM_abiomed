@@ -1,0 +1,12 @@
+{
+  "tokenizer_path": "forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000/checkpoints/final_tokenizer.pth",
+  "model_id": "amazon/chronos-t5-small",
+  "n_special_tokens": 2,
+  "pad_token_id": 0,
+  "eos_token_id": 1,
+  "vocab_size": 395,
+  "context_len": 8,
+  "label_len": 7,
+  "L": 3,
+  "num_channels": 12
+}

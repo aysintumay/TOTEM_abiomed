@@ -34,7 +34,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "abiomed_env"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "abiomed_env"))
 from model import TimeSeriesDataset
 
 # ── Feature metadata ──────────────────────────────────────────────────────────
@@ -720,7 +720,13 @@ class FewShotDigitTokenWorldModel(DigitTokenWorldModel):
             for _ in range(n):
                 out = self.llm.generate(
                     input_ids,
-                    max_new_tokens=512,   # digit tokens are ~5× more verbose than bins
+                    # 512 assumed ~1 token/digit (true for Llama's BPE vocab, per the class
+                    # docstring); Qwen2's tokenizer instead spends a separate token on each
+                    # inter-digit space (measured ~103 tokens for one 12-value row, ~620+ for
+                    # the full 6-row response), silently truncating mid-response and forcing
+                    # every sample into the unparseable-fallback path. 1024 covers that with
+                    # margin and costs nothing for tokenizers that stop earlier via EOS.
+                    max_new_tokens=1024,
                     temperature=self.temperature,
                     do_sample=True,
                     num_return_sequences=1,
@@ -757,6 +763,102 @@ class FewShotDigitTokenWorldModel(DigitTokenWorldModel):
         mean_norm = torch.tensor(arr.mean(axis=0), dtype=torch.float32)
         std_norm  = torch.tensor(arr.std(axis=0),  dtype=torch.float32)
         return mean_norm, std_norm
+
+    # ── batched LLM call: multiple DIFFERENT episodes in one generate() call ──
+    #
+    # predict()/_run_llm() above only ever batch the num_samples dimension for a
+    # SINGLE episode (and even that inefficiently -- a Python-level loop calling
+    # generate() n times instead of one generate() call with num_return_sequences=n).
+    # Full-test-set eval at that rate (~57s/episode measured) would take ~61 hours
+    # for one zero-shot or few-shot run. These two methods are purely additive --
+    # predict()/_run_llm() are untouched, so anything already relying on them keeps
+    # working exactly as before -- and pack B different episodes' prompts into one
+    # left-padded batch, each still sampled num_samples times via num_return_sequences,
+    # so total generate() batch size is B * num_samples.
+
+    def _run_llm_batch(self, query_msgs: list, few_shot_messages_list: list, n: int = 1) -> list:
+        """query_msgs: list of B user-query strings. few_shot_messages_list: list of B
+        (possibly None) few-shot message lists, same shape predict()'s few_shot_msgs
+        takes. Returns list of B lists, each with n raw decoded strings -- same shape
+        as calling _run_llm() B times, just batched into one generate() call."""
+        batch_messages = []
+        for query_msg, few_shot_messages in zip(query_msgs, few_shot_messages_list):
+            messages = [{"role": "system", "content": self._build_system_prompt()}]
+            if few_shot_messages:
+                for user_str, asst_str in few_shot_messages:
+                    messages.append({"role": "user", "content": user_str})
+                    messages.append({"role": "assistant", "content": asst_str})
+            messages.append({"role": "user", "content": query_msg})
+            batch_messages.append(messages)
+
+        # left-padding is required for decoder-only batched generation (new tokens
+        # must start at the same column index for every row); apply_chat_template's
+        # own padding=True handles this once padding_side is set correctly.
+        self.tokenizer.padding_side = "left"
+        enc = self.tokenizer.apply_chat_template(
+            batch_messages, add_generation_prompt=True, tokenize=True,
+            padding=True, return_dict=True, return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(self.llm.device)
+        attention_mask = enc["attention_mask"].to(self.llm.device)
+        B = input_ids.shape[0]
+
+        with torch.no_grad():
+            out = self.llm.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=1024,
+                temperature=self.temperature,
+                do_sample=True,
+                num_return_sequences=n,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            )
+        # every row shares the same (left-padded) prompt length, so a single
+        # prompt_len slice is valid for all B*n output rows regardless of each
+        # item's real, unpadded prompt length.
+        prompt_len = input_ids.shape[1]
+        decoded = [
+            self.tokenizer.decode(out[row][prompt_len:], skip_special_tokens=True)
+            for row in range(out.shape[0])
+        ]
+        # generate()'s num_return_sequences groups output as B blocks of n consecutive
+        # rows (row = b*n + s), matching flatten_channels' convention used elsewhere.
+        return [decoded[b * n : (b + 1) * n] for b in range(B)]
+
+    def predict_batch(self, contexts_norm: list, p_level_ints: list):
+        """Batched predict(): contexts_norm/p_level_ints are same-length lists (one
+        entry per episode). Returns a list of (mean_norm, std_norm) tuples, one per
+        episode, in the same order -- identical per-episode semantics to calling
+        predict() once per episode, just one generate() call for the whole batch."""
+        ctx_nps = [c.cpu().numpy() for c in contexts_norm]
+        query_msgs = [self._build_user_prompt(ctx_np, pl) for ctx_np, pl in zip(ctx_nps, p_level_ints)]
+
+        few_shot_msgs_list = []
+        for ctx_np in ctx_nps:
+            if self.k_shot > 0 and self._train_last_norm is not None:
+                examples = self._retrieve_examples(ctx_np[-1], self.k_shot)
+                few_shot_msgs_list.append([
+                    (self._format_example_user(ctx_ex, pl_ex),
+                     self._format_example_assistant(fc_ex, pl_ex))
+                    for ctx_ex, pl_ex, fc_ex in examples
+                ])
+            else:
+                few_shot_msgs_list.append(None)
+
+        raws_per_episode = self._run_llm_batch(query_msgs, few_shot_msgs_list, n=self.num_samples)
+
+        results = []
+        for context_norm, p_level_int, raws in zip(contexts_norm, p_level_ints, raws_per_episode):
+            samples = [p for raw in raws if (p := self._parse_response(raw, p_level_int)) is not None]
+            if not samples:
+                print(f"[FewShotDigitToken] All {self.num_samples} responses unparseable; using fallback.")
+                samples = [self._fallback(context_norm, p_level_int)]
+            arr = np.stack(samples)
+            results.append((
+                torch.tensor(arr.mean(axis=0), dtype=torch.float32),
+                torch.tensor(arr.std(axis=0), dtype=torch.float32),
+            ))
+        return results
 
     def sample_multiple(self, x: torch.Tensor, pl, num_samples: int = 10) -> torch.Tensor:
         if isinstance(pl, int):

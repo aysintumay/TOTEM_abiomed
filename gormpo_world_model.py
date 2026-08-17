@@ -132,7 +132,7 @@ class GormpoFewShotWorldModel:
         print(f"Loading tokenizer: {model_id}")
         self.llm_tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        model_kwargs = {"dtype": torch.bfloat16, "device_map": device}
+        model_kwargs = {"torch_dtype": torch.bfloat16, "device_map": device}
         if load_in_4bit:
             from transformers import BitsAndBytesConfig
             model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -296,34 +296,25 @@ class GormpoFewShotWorldModel:
 
     # ── prompt helpers ────────────────────────────────────────────────────────
 
+    # mcs.md is the single source of truth for both the physiology/task spec and the
+    # GORMPO tokenization scheme (see its "Tokenization (GORMPO)" section) -- read
+    # once per process, not re-parsed on every prompt build.
+    _MCS_MD_PATH = os.path.join(_ROOT, "mcs.md")
+    _mcs_md_cache = None
+
+    @classmethod
+    def _load_mcs_md(cls) -> str:
+        if cls._mcs_md_cache is None:
+            with open(cls._MCS_MD_PATH, "r") as f:
+                cls._mcs_md_cache = f.read()
+        return cls._mcs_md_cache
+
     def _build_system_prompt(self) -> str:
-        col_order = ", ".join(FEATURE_NAMES)
         return (
-            "You are a clinical AI assistant expert in Impella LVAD management in the ICU.\n\n"
-            "The Impella pump supports the failing heart via P-levels P2–P10. "
-            "Higher P-level = more support: higher PumpSpeed/PumpFlow, lower LV preload, lower PULSAT.\n\n"
-            "=== VALUE ENCODING: GORMPO TOKENIZER ===\n"
-            "Each variable's history is summarized as a discrete token, not a raw number, produced by a "
-            "learned tokenizer (a cross-channel-attention VQ-VAE). Each token has these parts, always in "
-            "this fixed order, space-separated, ONE ROW PER VARIABLE (no labels -- row i is always "
-            "variable i from the FEATURE ORDER list below):\n\n"
-            "  c0 c1 c2 mu sigma min max reward\n\n"
-            "  c0,c1,c2 = three integers in [0, 255], indices into a learned codebook of 256 morphological "
-            "patterns. Codes are CATEGORICAL, not ordered by magnitude: code 200 is not \"bigger\" than "
-            "code 50, it is a different learned shape. The only way to know what a given code implies is "
-            "by comparing it against the worked examples given to you below.\n"
-            "  mu,sigma,min,max = each an integer bin in [0, 31], the patch's mean/std/min/max value "
-            "quantized into 32 bins, ordered low(0) to high(31) within that variable's own observed range.\n"
-            "  reward = an integer in [0, 8]. Only meaningful for PumpPressure (used as MAP), Heart Rate, "
-            "and PULSAT (rows 0, 9, 7); 0 for every other row, always. 1-8 encodes increasing clinical "
-            "instability risk (based on standard MAP/HR/pulsatility thresholds); it is context only, "
-            "never something you predict.\n\n"
-            "=== FEATURE ORDER (row 0 - row 10 in every context/prediction block) ===\n"
-            f"{col_order}\n\n"
-            "=== CLINICAL TARGETS (physical units) ===\n"
-            "PumpPressure ≥ 60 mmHg  |  LVEDP < 18 mmHg  |  PULSAT ≥ 20 mmHg  "
-            "|  Heart Rate 50–100 bpm  |  SYSTOLIC 90–130 mmHg\n\n"
-            "Weaning goal: reduce Pump Level gradually while hemodynamics stay stable.\n\n"
+            "You are a clinical AI assistant expert in Impella LVAD management in the ICU. "
+            "The following is the full project specification, including the exact token format "
+            "you will read and must produce:\n\n"
+            f"{self._load_mcs_md()}\n\n"
             "=== TASK ===\n"
             f"You receive {self.forecast_horizon} timesteps of context, tokenized as 11 rows (one per "
             "variable, Pump Level excluded since it's the action) in the format above, then a new Pump "
@@ -400,9 +391,21 @@ class GormpoFewShotWorldModel:
 
         rows = []
         for line in text.splitlines():
-            parts = line.strip().split()
-            if len(parts) != 7:
+            # Observed failure mode: chat-tuned models default to markdown list/heading
+            # habits ("## 232 132 ...", "- 232 132 ...") despite the "no markdown"
+            # instruction, which otherwise well-formed rows fail on: int("##") raises.
+            # Strip only leading list/heading punctuation, not interior characters.
+            line = re.sub(r"^[\s#\-*>]+", "", line.strip())
+            parts = line.split()
+            # Observed failure mode (both stock and LoRA-merged Llama3-Med42-8B):
+            # the model echoes an 8th trailing value on every row -- almost certainly
+            # the reward field from the *context* block's 8-field format (Eq 24),
+            # even though the TASK section explicitly asks for 7 (no reward) on the
+            # predicted row. Accept 7 or 8 and keep only the first 7 rather than
+            # rejecting an otherwise well-formed, in-range row outright.
+            if len(parts) not in (7, 8):
                 continue  # skip blank/stray lines (e.g. accidental labels, markdown)
+            parts = parts[:7]
             try:
                 rows.append([int(p) for p in parts])
             except ValueError:
@@ -510,6 +513,131 @@ class GormpoFewShotWorldModel:
         mean_norm = torch.tensor((mean_phys - m) / s, dtype=torch.float32)
         std_norm = torch.tensor(std_phys / s, dtype=torch.float32)
         return mean_norm, std_norm
+
+    # ── batched LLM call: multiple DIFFERENT episodes in one generate() call ──
+    #
+    # _generate_samples()/predict() above only batch the num_samples dimension for a
+    # SINGLE episode. Full-test-set eval at that rate is ~13-14.5h for zero-shot/
+    # few-shot (measured on a 100-example pilot). These methods are purely additive --
+    # _generate_samples()/predict() are untouched -- and pack B different episodes'
+    # prompts into one left-padded batch, each still sampled num_samples times via
+    # num_return_sequences, so total generate() batch size is B * num_samples. Same
+    # pattern as world_model.py's FewShotDigitTokenWorldModel.predict_batch().
+
+    def _run_llm_batch(self, query_msgs: list, few_shot_messages_list: list, n: int = 1) -> list:
+        """query_msgs: list of B user-query strings. few_shot_messages_list: list of B
+        (possibly None) few-shot message lists, same shape _generate_samples()'s
+        few_shot_msgs takes. Returns list of B lists, each with n raw decoded strings."""
+        batch_messages = []
+        for query_msg, few_shot_messages in zip(query_msgs, few_shot_messages_list):
+            messages = [{"role": "system", "content": self._build_system_prompt()}]
+            if few_shot_messages:
+                for user_str, asst_str in few_shot_messages:
+                    messages.append({"role": "user", "content": user_str})
+                    messages.append({"role": "assistant", "content": asst_str})
+            messages.append({"role": "user", "content": query_msg})
+            batch_messages.append(messages)
+
+        # left-padding is required for decoder-only batched generation (new tokens
+        # must start at the same column index for every row).
+        self.llm_tokenizer.padding_side = "left"
+        enc = self.llm_tokenizer.apply_chat_template(
+            batch_messages, add_generation_prompt=True, tokenize=True,
+            padding=True, return_dict=True, return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(self.llm.device)
+        attention_mask = enc["attention_mask"].to(self.llm.device)
+        B = input_ids.shape[0]
+
+        with torch.no_grad():
+            out = self.llm.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=256,  # 11 rows * 7 ints, compact (no labels/JSON) -- measured ~154 tokens
+                temperature=self.temperature,
+                do_sample=True,
+                num_return_sequences=n,
+                pad_token_id=self.llm_tokenizer.pad_token_id or self.llm_tokenizer.eos_token_id,
+            )
+        # every row shares the same (left-padded) prompt length, so a single
+        # prompt_len slice is valid for all B*n output rows.
+        prompt_len = input_ids.shape[1]
+        decoded = [
+            self.llm_tokenizer.decode(out[row][prompt_len:], skip_special_tokens=True)
+            for row in range(out.shape[0])
+        ]
+        # generate()'s num_return_sequences groups output as B blocks of n consecutive
+        # rows (row = b*n + s).
+        return [decoded[b * n : (b + 1) * n] for b in range(B)]
+
+    def _generate_samples_batch(self, contexts_norm: list, p_level_ints: list, n: int) -> list:
+        """Batched _generate_samples(): contexts_norm/p_level_ints are same-length lists
+        (one entry per episode). Returns a list of (n_valid, forecast_horizon, 12)
+        physical-unit arrays, one per episode, same order as inputs."""
+        ctx_physicals = [self._unnorm_context(c) for c in contexts_norm]
+        ctx_tokens_list = [self._tokenize_patch(cp[:, :-1]) for cp in ctx_physicals]
+        query_msgs = [self._build_user_prompt(ct, pl) for ct, pl in zip(ctx_tokens_list, p_level_ints)]
+
+        few_shot_msgs_list = []
+        for context_norm in contexts_norm:
+            if self.k_shot > 0 and self._train_last_norm is not None:
+                query_last_norm = context_norm[-1].cpu().numpy()
+                examples = self._retrieve_examples(query_last_norm, self.k_shot)
+                few_shot_msgs = []
+                for ctx_ex, pl_ex, fc_ex in examples:
+                    ex_ctx_tokens = self._tokenize_patch(ctx_ex[:, :-1])
+                    ex_fc_tokens = self._tokenize_patch(fc_ex[:, :-1])
+                    few_shot_msgs.append((
+                        self._build_user_prompt(ex_ctx_tokens, pl_ex),
+                        self._format_example_assistant(ex_fc_tokens),
+                    ))
+                few_shot_msgs_list.append(few_shot_msgs)
+            else:
+                few_shot_msgs_list.append(None)
+
+        raws_per_episode = self._run_llm_batch(query_msgs, few_shot_msgs_list, n=n)
+
+        results = []
+        for context_norm, p_level_int, raws in zip(contexts_norm, p_level_ints, raws_per_episode):
+            samples = []
+            for raw in raws:
+                pred_tokens = self._parse_response(raw)
+                if pred_tokens is None:
+                    continue
+                try:
+                    pred_phys = self._detokenize_channels(
+                        pred_tokens["q_shape"][0], pred_tokens["q_mu"][0], pred_tokens["q_sigma"][0]
+                    )
+                except Exception as e:
+                    print(f"[GormpoFewShot] Unexpected decode failure, skipping sample: {e}")
+                    continue
+                if self._phys_low is not None:
+                    pred_phys = np.clip(pred_phys, self._phys_low, self._phys_high)
+                pl_col = np.full((self.forecast_horizon, 1), float(p_level_int), dtype=np.float32)
+                samples.append(np.concatenate([pred_phys, pl_col], axis=1))
+
+            if not samples:
+                print(f"[GormpoFewShot] All {n} responses unparseable; using fallback.")
+                samples = [self._fallback(context_norm, p_level_int)]
+
+            results.append(np.stack(samples))
+        return results
+
+    def predict_batch(self, contexts_norm: list, p_level_ints: list):
+        """Batched predict(): returns a list of (mean_norm, std_norm) tuples, one per
+        episode, in the same order -- identical per-episode semantics to calling
+        predict() once per episode, just one generate() call for the whole batch."""
+        arrs = self._generate_samples_batch(contexts_norm, p_level_ints, self.num_samples)
+        m = self.mean[self.columns].detach().cpu().numpy()
+        s = self.std[self.columns].detach().cpu().numpy()
+
+        results = []
+        for arr in arrs:
+            mean_phys, std_phys = arr.mean(axis=0), arr.std(axis=0)
+            mean_norm = torch.tensor((mean_phys - m) / s, dtype=torch.float32)
+            std_norm = torch.tensor(std_phys / s, dtype=torch.float32)
+            results.append((mean_norm, std_norm))
+        return results
 
     def _resolve_pl(self, pl) -> int:
         """pl is either a plain P-level int, or a normalized tensor/array to unnormalize first."""

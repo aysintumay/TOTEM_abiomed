@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from transformers import get_constant_schedule_with_warmup
 
 from lib.models.gormpo_llm_forecaster import (
     GormpoTokenLLMForecaster,
@@ -60,9 +61,11 @@ def _unpack(data, device):
     return x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, y_mu, y_sigma, y_min, y_max
 
 
-def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scalar_loss_weight):
+def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scalar_loss_weight, grad_accum_steps=1):
     running_loss, running_shape_loss, running_scalar_loss, running_acc = 0.0, 0.0, 0.0, 0.0
     log_every = max(len(dataloader) // 3, 3)
+    num_batches = len(dataloader)
+    optimizer.zero_grad()
 
     for i, data in enumerate(dataloader):
         (_, _, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, y_mu, y_sigma, y_min, y_max) = _unpack(data, device)
@@ -87,11 +90,20 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
 
         loss = loss_shape + scalar_loss_weight * loss_scalar
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        # Gradient accumulation: physical batch size stays whatever fits in memory
+        # (GPU 1 is shared and its free memory fluctuates with other users' jobs --
+        # see train run history), but summing gradients over grad_accum_steps
+        # micro-batches before each optimizer step simulates a larger *effective*
+        # batch (less noisy gradient estimate) at the same peak memory footprint as
+        # a single micro-batch. Divide by grad_accum_steps so accumulated grads
+        # average correctly instead of summing to grad_accum_steps times their scale.
+        (loss / grad_accum_steps).backward()
+        is_last_batch = (i + 1) == num_batches
+        if (i + 1) % grad_accum_steps == 0 or is_last_batch:
+            optimizer.step()
+            optimizer.zero_grad()
+            if scheduler is not None:
+                scheduler.step()
 
         with torch.no_grad():
             mask = labels != -100
@@ -189,6 +201,7 @@ def train(args):
         llm_name=args.llm_name, num_embeddings=args.codebook_size, num_bins=args.num_bins,
         lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules.split(","),
+        load_in_4bit=args.load_in_4bit, device=args.cuda_id,
     )
     model.to(device)
 
@@ -197,14 +210,20 @@ def train(args):
           " / total params:", sum(p.numel() for p in model.parameters()))
 
     optimizer = torch.optim.Adam(trainable_params, lr=args.baselr)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer=optimizer, max_lr=args.baselr, steps_per_epoch=len(train_dataloader),
-        epochs=args.epochs, pct_start=0.2,
-    )
+    # OneCycleLR needs epochs * steps_per_epoch up front to shape its warmup/anneal
+    # curve, but EarlyStopping can (and did, in an earlier run: stopped at epoch 7 of
+    # a schedule sized for 50) cut training off long before that horizon -- stranding
+    # LR mid-ramp, far below its configured peak, for the entire run. A warmup-then-
+    # constant schedule doesn't need to know the eventual stopping point, so it can't
+    # be orphaned by early stopping the same way.
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps)
 
     for epoch in range(args.epochs):
         model.train()
-        train_one_epoch(train_dataloader, model, optimizer, scheduler, epoch, device, args.scalar_loss_weight)
+        train_one_epoch(
+            train_dataloader, model, optimizer, scheduler, epoch, device,
+            args.scalar_loss_weight, args.grad_accum_steps,
+        )
 
         val_mse, val_mae = run_eval(val_dataloader, model, tokenizer, device, "Val", save_file)
         early_stopping_counter = early_stopping(val_mse, val_mae, {"gormpo_llm_forecaster": model})
@@ -229,13 +248,22 @@ if __name__ == "__main__":
     parser.add_argument("--num_bins", default=32, type=int)
     parser.add_argument("--scalar_loss_weight", default=1.0, type=float)
     parser.add_argument("--batchsize", default=128, type=int)
+    parser.add_argument("--grad_accum_steps", default=1, type=int,
+                         help="Accumulate gradients over this many micro-batches per optimizer step, "
+                              "simulating a larger effective batch (batchsize * grad_accum_steps) at the "
+                              "same peak memory as --batchsize alone.")
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--checkpoint", action="store_true", default=True)
     parser.add_argument("--checkpoint_path", default="saved_models/gormpo_llm_mcs/checkpoints/", type=str)
     parser.add_argument("--patience", default=5, type=int)
     parser.add_argument("--baselr", default=1e-4, type=float)
+    parser.add_argument("--warmup_steps", default=200, type=int,
+                         help="Linear LR warmup steps before holding constant at --baselr; unlike OneCycleLR "
+                              "this does not need a total-steps horizon, so early stopping can't strand it mid-ramp.")
     parser.add_argument("--epochs", default=50, type=int)
     parser.add_argument("--llm_name", default="Qwen/Qwen2.5-0.5B", type=str)
+    parser.add_argument("--load_in_4bit", action="store_true", default=False,
+                         help="QLoRA: load the base LLM in 4-bit (bitsandbytes) to fit larger backbones on a shared GPU.")
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)

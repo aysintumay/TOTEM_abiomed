@@ -21,7 +21,7 @@ per-facet embedding/head logic added here.
 import torch
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 from lib.models.core import BaseModel
 
@@ -48,6 +48,8 @@ class GormpoTokenLLMForecaster(BaseModel):
         lora_dropout=0.05,
         lora_target_modules=None,
         hf_model=None,
+        load_in_4bit=False,
+        device=None,
     ):
         super().__init__()
         if lora_target_modules is None:
@@ -57,10 +59,42 @@ class GormpoTokenLLMForecaster(BaseModel):
             ]
 
         if hf_model is None:
-            hf_model = AutoModelForCausalLM.from_pretrained(llm_name, torch_dtype="auto")
+            model_kwargs = {"torch_dtype": "auto"}
+            if load_in_4bit:
+                # QLoRA: quantize the frozen base weights to 4-bit (e.g. an 8B model's
+                # ~16GB bf16 footprint drops to ~4-5GB) so it fits alongside whatever
+                # else is already resident on a shared GPU; LoRA adapters/new heads
+                # below stay full-precision and trainable as before. device_map pins
+                # the quantized weights directly to `device` at load time -- bitsandbytes
+                # 4-bit params reject a later whole-model .to(device) call with a
+                # different device, so this must happen here, not by the caller.
+                model_kwargs["torch_dtype"] = torch.bfloat16
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                model_kwargs["device_map"] = {"": device if device is not None else 0}
+            hf_model = AutoModelForCausalLM.from_pretrained(llm_name, **model_kwargs)
+            if load_in_4bit:
+                # This class only ever uses hf_model.model (the inner transformer) below --
+                # the LM head is never called (its own shape/scalar heads replace it, and
+                # forward() is always given inputs_embeds directly, which also bypasses the
+                # input embedding lookup). Drop it now rather than leaving it resident: a
+                # peft.prepare_model_for_kbit_training-style fp32 upcast of a Llama-scale
+                # (~128k-vocab) head/embedding table costs ~2GB by itself, which is what was
+                # blowing the budget here -- every GB matters on a shared GPU running other
+                # jobs. LoRA (get_peft_model, below) freezes every non-adapter backbone
+                # param on its own, so no separate requires_grad_(False) pass is needed.
+                del hf_model.lm_head
         backbone = hf_model.model
         self.hidden_size = backbone.config.hidden_size
         backbone_dtype = next(backbone.parameters()).dtype
+        if load_in_4bit:
+            # backbone's quantized Params4bit report their storage dtype (uint8), not the
+            # bf16 compute dtype the new embeddings/heads below need to stay consistent with.
+            backbone_dtype = torch.bfloat16
 
         lora_cfg = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
