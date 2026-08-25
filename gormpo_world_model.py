@@ -11,11 +11,12 @@ injected as alternating user/assistant few-shot turns, then the real query.
 What's different from world_model.py: each channel's context/target patch is
 encoded through the trained GormpoTokenizer into its actual token schema --
 q_shape (a codebook index per compressed position, Eq 19), q_mu/q_sigma/q_min/q_max
-(quantized scale statistics, Eq 20-23), q_r (clinical reward bin, Eq 24, context
-only for MAP/HR/Pulsatility channels) -- and the system prompt explicitly teaches
-the LLM what each of these token components means, since (unlike a raw-value bin
-index) a VQ shape code has no inherent physical ordering the LLM could infer on its
-own; the few-shot examples are what let it ground codes to outcomes in context.
+(quantized scale statistics, Eq 20-23), and three per-patch (not per-channel)
+clinical reward bins q_r_map/q_r_hr/q_r_pulsat (Eq 24-25, context only, appended to
+every channel's row) -- and the system prompt explicitly teaches the LLM what each
+of these token components means, since (unlike a raw-value bin index) a VQ shape
+code has no inherent physical ordering the LLM could infer on its own; the few-shot
+examples are what let it ground codes to outcomes in context.
 
 Tokenizer used: the from-scratch, MCS-specialist tokenizer that showed no
 overfitting across 2000 epochs of training (saved_models/gormpo_tokenizer_mcs_scratch_long2000
@@ -193,7 +194,7 @@ class GormpoFewShotWorldModel:
         last_norm = np.empty((n, self.num_channels), dtype=np.float32)
         ctx_phys = np.empty((n, T, self.num_channels), dtype=np.float32)
         fc_phys = np.empty((n, T, self.num_channels), dtype=np.float32)
-        pl_int = np.empty(n, dtype=np.int32)
+        pl_int = np.empty((n, T), dtype=np.int32)  # per-step action, not a per-episode scalar
 
         m = self.mean[self.columns].numpy()
         s = self.std[self.columns].numpy()
@@ -203,15 +204,20 @@ class GormpoFewShotWorldModel:
             xi_np = np.asarray(xi, dtype=np.float32)  # (T, 12) normalized
             yi_np = np.asarray(yi, dtype=np.float32).reshape(T, self.num_channels - 1)
 
-            pl_raw = float(np.asarray(pli).mean())
-            pl_phys = pl_raw * float(self.std[-1]) + float(self.mean[-1])
-            pl_norm_col = np.full((T, 1), pl_raw, dtype=np.float32)
-            fc_norm = np.concatenate([yi_np, pl_norm_col], axis=1)  # (T, 12)
+            # pli is already the true per-step P-level trajectory (TimeSeriesDataset's own
+            # (T,) pl split) -- previously this was collapsed via .mean() before ever being
+            # used, which (a) discarded real within-window action changes and (b) meant the
+            # "ground truth" few-shot example patch shown to the LLM had a smeared/incorrect
+            # P-level column instead of what actually happened. Use it as-is, matching how
+            # the reference Transformer digital twin consumes pl (see model.py forward()).
+            pl_norm = np.asarray(pli, dtype=np.float32).reshape(T)
+            pl_phys = pl_norm * float(self.std[-1]) + float(self.mean[-1])
+            fc_norm = np.concatenate([yi_np, pl_norm.reshape(T, 1)], axis=1)  # (T, 12)
 
             last_norm[i] = xi_np[-1]
             ctx_phys[i] = xi_np * s + m
             fc_phys[i] = fc_norm * s + m
-            pl_int[i] = int(round(pl_phys))
+            pl_int[i] = np.round(pl_phys).astype(np.int32)
 
         self._train_last_norm = last_norm
         self._train_ctx_phys = ctx_phys
@@ -220,14 +226,15 @@ class GormpoFewShotWorldModel:
         print(f"[GormpoFewShot] Retrieval index ready ({n} examples).")
 
     def _retrieve_examples(self, query_last_norm: np.ndarray, k: int) -> list:
-        """Returns list of (ctx_phys, pl_int, fc_phys), physical units."""
+        """Returns list of (ctx_phys, pl_seq, fc_phys), physical units. pl_seq is the
+        example's real (forecast_horizon,) per-step P-level trajectory, not a scalar."""
         diffs = self._train_last_norm - query_last_norm[None, :]
         dists = (diffs ** 2).sum(axis=1)
         k_eff = min(k, len(dists))
         idxs = np.argpartition(dists, k_eff)[:k_eff]
         idxs = idxs[np.argsort(dists[idxs])]
         return [
-            (self._train_ctx_phys[i], int(self._train_pl_int[i]), self._train_fc_phys[i])
+            (self._train_ctx_phys[i], self._train_pl_int[i], self._train_fc_phys[i])
             for i in idxs
         ]
 
@@ -317,9 +324,10 @@ class GormpoFewShotWorldModel:
             f"{self._load_mcs_md()}\n\n"
             "=== TASK ===\n"
             f"You receive {self.forecast_horizon} timesteps of context, tokenized as 11 rows (one per "
-            "variable, Pump Level excluded since it's the action) in the format above, then a new Pump "
-            "Level action. Predict the NEXT patch's token for each of the 11 variables: c0 c1 c2 mu sigma "
-            "min max (7 integers, no reward).\n"
+            "variable, Pump Level excluded since it's the action) in the format above, then the chosen "
+            f"Pump Level for EACH of the next {self.forecast_horizon} steps (one value per step, not a "
+            "single action held constant -- it can change within the window). Predict the NEXT patch's "
+            "token for each of the 11 variables: c0 c1 c2 mu sigma min max (7 integers, no reward).\n"
             "A few worked examples (similar past situations and what actually happened next) are given "
             "before the real query -- use them to infer what the codes and bins mean in context.\n\n"
             "Return ONLY 11 rows, one per line, 7 space-separated integers each, no labels, no "
@@ -328,8 +336,14 @@ class GormpoFewShotWorldModel:
 
     def _format_patch_tokens(self, tokens: dict, include_reward: bool) -> str:
         """tokens: dict from _tokenize_patch (batch dim 1). One compact row per channel, no
-        labels -- row order matches FEATURE_NAMES, as declared once in the system prompt."""
+        labels -- row order matches FEATURE_NAMES, as declared once in the system prompt.
+        The three reward fields (Eq 24-25) are per-patch, not per-channel -- unlike shape/
+        mu/sigma/min/max, the same three values are appended to every row, not read per i."""
         lines = []
+        if include_reward:
+            r_map = int(tokens["q_r_map"][0])
+            r_hr = int(tokens["q_r_hr"][0])
+            r_pulsat = int(tokens["q_r_pulsat"][0])
         for i in range(self.num_channels - 1):  # exclude Pump Level channel (index 11), it's the action
             c0, c1, c2 = tokens["q_shape"][0, i].tolist()
             mu = int(tokens["q_mu"][0, i])
@@ -338,15 +352,18 @@ class GormpoFewShotWorldModel:
             mx = int(tokens["q_max"][0, i])
             vals = [c0, c1, c2, mu, sigma, mn, mx]
             if include_reward:
-                vals.append(int(tokens["q_r"][0, i]))
+                vals.extend([r_map, r_hr, r_pulsat])
             lines.append(" ".join(str(v) for v in vals))
         return "\n".join(lines)
 
-    def _build_user_prompt(self, ctx_tokens: dict, p_level_int: int) -> str:
+    def _build_user_prompt(self, ctx_tokens: dict, p_level_seq) -> str:
+        """p_level_seq: array-like of forecast_horizon ints, one P-level per predicted step
+        (already resolved to this shape by the caller -- see _as_pl_seq)."""
+        action_str = " ".join(f"P{int(p)}" for p in p_level_seq)
         return (
             f"## Context ({self.forecast_horizon} timesteps, tokenized, 11 rows):\n"
             f"{self._format_patch_tokens(ctx_tokens, include_reward=True)}\n\n"
-            f"## Action: new Pump Level = P{p_level_int}\n\n"
+            f"## Action: Pump Level for each of the next {self.forecast_horizon} steps = {action_str}\n\n"
             "## Predict the next patch's token for each variable (11 rows, 7 ints each, see format above):"
         )
 
@@ -398,12 +415,13 @@ class GormpoFewShotWorldModel:
             line = re.sub(r"^[\s#\-*>]+", "", line.strip())
             parts = line.split()
             # Observed failure mode (both stock and LoRA-merged Llama3-Med42-8B):
-            # the model echoes an 8th trailing value on every row -- almost certainly
-            # the reward field from the *context* block's 8-field format (Eq 24),
-            # even though the TASK section explicitly asks for 7 (no reward) on the
-            # predicted row. Accept 7 or 8 and keep only the first 7 rather than
+            # the model echoes trailing values from the *context* block's format on
+            # otherwise-correct predicted rows, even though the TASK section explicitly
+            # asks for 7 (no reward) on the predicted row. Context rows now carry 10
+            # fields (7 + 3 reward, Eq 24-25), so up to 3 spurious trailing echoes are
+            # possible, not just 1 -- accept 7-10 and keep only the first 7 rather than
             # rejecting an otherwise well-formed, in-range row outright.
-            if len(parts) not in (7, 8):
+            if len(parts) not in (7, 8, 9, 10):
                 continue  # skip blank/stray lines (e.g. accidental labels, markdown)
             parts = parts[:7]
             try:
@@ -435,17 +453,34 @@ class GormpoFewShotWorldModel:
             q_sigma[0, i] = sigma
         return {"q_shape": q_shape, "q_mu": q_mu, "q_sigma": q_sigma}
 
-    def _fallback(self, context_norm: torch.Tensor, p_level_int: int) -> np.ndarray:
-        """Last-observation carry-forward in physical units, (forecast_horizon, 12)."""
+    def _as_pl_seq(self, p_level) -> np.ndarray:
+        """Normalizes either a plain P-level int (held constant across the horizon, for RL
+        rollout convenience -- mirrors WorldModel.step()'s own int-tiling) or an already
+        per-step array-like into a canonical (forecast_horizon,) int array. Every internal
+        method below assumes it always receives this canonical shape."""
+        if isinstance(p_level, (int, np.integer)):
+            return np.full(self.forecast_horizon, int(p_level), dtype=np.int64)
+        arr = np.asarray(p_level).reshape(-1)
+        assert arr.shape[0] == self.forecast_horizon, (
+            f"expected {self.forecast_horizon} per-step P-level values, got {arr.shape[0]}"
+        )
+        return arr.astype(np.int64)
+
+    def _fallback(self, context_norm: torch.Tensor, p_level_seq) -> np.ndarray:
+        """Last-observation carry-forward in physical units, (forecast_horizon, 12) --
+        the 11 physiological channels repeat the last observed context row, but the Pump
+        Level column now follows the real per-step action sequence, not one repeated value."""
         last = self._unnorm_context(context_norm)[-1].copy()
-        last[-1] = float(p_level_int)
-        return np.tile(last, (self.forecast_horizon, 1)).astype(np.float32)
+        out = np.tile(last, (self.forecast_horizon, 1)).astype(np.float32)
+        out[:, -1] = np.asarray(p_level_seq, dtype=np.float32)
+        return out
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def _generate_samples(self, context_norm: torch.Tensor, p_level_int: int, n: int) -> np.ndarray:
+    def _generate_samples(self, context_norm: torch.Tensor, p_level, n: int) -> np.ndarray:
         """Returns (n_valid, forecast_horizon, 12) physical-unit samples (n_valid <= n;
         falls back to a single last-observation-carry-forward sample if none parse)."""
+        p_level_seq = self._as_pl_seq(p_level)
         ctx_physical = self._unnorm_context(context_norm)  # (T, 12)
         ctx_tokens = self._tokenize_patch(ctx_physical[:, :-1])  # exclude Pump Level column
 
@@ -462,7 +497,7 @@ class GormpoFewShotWorldModel:
                     self._format_example_assistant(ex_fc_tokens),
                 ))
 
-        user_prompt = self._build_user_prompt(ctx_tokens, p_level_int)
+        user_prompt = self._build_user_prompt(ctx_tokens, p_level_seq)
         raws = self._run_llm(user_prompt, few_shot_messages=few_shot_msgs, n=n)
 
         samples = []
@@ -490,22 +525,24 @@ class GormpoFewShotWorldModel:
                 # prediction -- clipped to the same training-data percentile bounds
                 # (compute_variable_ylims) used for this model's plotting axes too.
                 pred_phys = np.clip(pred_phys, self._phys_low, self._phys_high)
-            pl_col = np.full((self.forecast_horizon, 1), float(p_level_int), dtype=np.float32)
+            pl_col = p_level_seq.astype(np.float32).reshape(self.forecast_horizon, 1)
             samples.append(np.concatenate([pred_phys, pl_col], axis=1))  # (forecast_horizon, 12)
 
         if not samples:
             print(f"[GormpoFewShot] All {n} responses unparseable; using fallback.")
-            samples = [self._fallback(context_norm, p_level_int)]
+            samples = [self._fallback(context_norm, p_level_seq)]
 
         return np.stack(samples)
 
-    def predict(self, context_norm: torch.Tensor, p_level_int: int):
+    def predict(self, context_norm: torch.Tensor, p_level):
         """
         context_norm : (T, 12) normalized tensor.
-        p_level_int  : int P-level action (2–10).
+        p_level      : P-level action -- either an int (held constant across the horizon)
+                       or a (forecast_horizon,) array-like, one value per predicted step
+                       (matches how the reference Transformer digital twin consumes pl).
         Returns (mean_norm, std_norm), each (forecast_horizon, 12) normalized tensor.
         """
-        arr = self._generate_samples(context_norm, p_level_int, self.num_samples)
+        arr = self._generate_samples(context_norm, p_level, self.num_samples)
         mean_phys, std_phys = arr.mean(axis=0), arr.std(axis=0)
 
         m = self.mean[self.columns].detach().cpu().numpy()
@@ -570,13 +607,15 @@ class GormpoFewShotWorldModel:
         # rows (row = b*n + s).
         return [decoded[b * n : (b + 1) * n] for b in range(B)]
 
-    def _generate_samples_batch(self, contexts_norm: list, p_level_ints: list, n: int) -> list:
-        """Batched _generate_samples(): contexts_norm/p_level_ints are same-length lists
-        (one entry per episode). Returns a list of (n_valid, forecast_horizon, 12)
-        physical-unit arrays, one per episode, same order as inputs."""
+    def _generate_samples_batch(self, contexts_norm: list, p_levels: list, n: int) -> list:
+        """Batched _generate_samples(): contexts_norm/p_levels are same-length lists
+        (one entry per episode; each p_level is an int or a (forecast_horizon,) array-like,
+        see _as_pl_seq). Returns a list of (n_valid, forecast_horizon, 12) physical-unit
+        arrays, one per episode, same order as inputs."""
+        p_level_seqs = [self._as_pl_seq(pl) for pl in p_levels]
         ctx_physicals = [self._unnorm_context(c) for c in contexts_norm]
         ctx_tokens_list = [self._tokenize_patch(cp[:, :-1]) for cp in ctx_physicals]
-        query_msgs = [self._build_user_prompt(ct, pl) for ct, pl in zip(ctx_tokens_list, p_level_ints)]
+        query_msgs = [self._build_user_prompt(ct, pl) for ct, pl in zip(ctx_tokens_list, p_level_seqs)]
 
         few_shot_msgs_list = []
         for context_norm in contexts_norm:
@@ -598,7 +637,7 @@ class GormpoFewShotWorldModel:
         raws_per_episode = self._run_llm_batch(query_msgs, few_shot_msgs_list, n=n)
 
         results = []
-        for context_norm, p_level_int, raws in zip(contexts_norm, p_level_ints, raws_per_episode):
+        for context_norm, p_level_seq, raws in zip(contexts_norm, p_level_seqs, raws_per_episode):
             samples = []
             for raw in raws:
                 pred_tokens = self._parse_response(raw)
@@ -613,21 +652,22 @@ class GormpoFewShotWorldModel:
                     continue
                 if self._phys_low is not None:
                     pred_phys = np.clip(pred_phys, self._phys_low, self._phys_high)
-                pl_col = np.full((self.forecast_horizon, 1), float(p_level_int), dtype=np.float32)
+                pl_col = p_level_seq.astype(np.float32).reshape(self.forecast_horizon, 1)
                 samples.append(np.concatenate([pred_phys, pl_col], axis=1))
 
             if not samples:
                 print(f"[GormpoFewShot] All {n} responses unparseable; using fallback.")
-                samples = [self._fallback(context_norm, p_level_int)]
+                samples = [self._fallback(context_norm, p_level_seq)]
 
             results.append(np.stack(samples))
         return results
 
-    def predict_batch(self, contexts_norm: list, p_level_ints: list):
+    def predict_batch(self, contexts_norm: list, p_levels: list):
         """Batched predict(): returns a list of (mean_norm, std_norm) tuples, one per
         episode, in the same order -- identical per-episode semantics to calling
-        predict() once per episode, just one generate() call for the whole batch."""
-        arrs = self._generate_samples_batch(contexts_norm, p_level_ints, self.num_samples)
+        predict() once per episode, just one generate() call for the whole batch.
+        p_levels: list of ints or (forecast_horizon,) array-likes, see _as_pl_seq."""
+        arrs = self._generate_samples_batch(contexts_norm, p_levels, self.num_samples)
         m = self.mean[self.columns].detach().cpu().numpy()
         s = self.std[self.columns].detach().cpu().numpy()
 
@@ -639,12 +679,18 @@ class GormpoFewShotWorldModel:
             results.append((mean_norm, std_norm))
         return results
 
-    def _resolve_pl(self, pl) -> int:
-        """pl is either a plain P-level int, or a normalized tensor/array to unnormalize first."""
+    def _resolve_pl(self, pl):
+        """pl is either a plain P-level int (held constant across the horizon, matching
+        WorldModel.step()'s own int-tiling behavior) or a normalized tensor/array already
+        shaped (forecast_horizon,) to unnormalize per-step -- previously this collapsed
+        the latter to a single .mean() value, discarding real within-window action
+        changes. Returns an int or a (forecast_horizon,) array; both are valid inputs to
+        predict()/_generate_samples(), which normalize via _as_pl_seq."""
         if isinstance(pl, int):
             return pl
-        pl_t = pl.float().mean() if isinstance(pl, torch.Tensor) else torch.tensor(pl, dtype=torch.float32)
-        return int(round(self.unnorm_pl(pl_t).item()))
+        pl_t = pl if isinstance(pl, torch.Tensor) else torch.tensor(pl, dtype=torch.float32)
+        pl_t = pl_t.reshape(-1).float()
+        return self.unnorm_pl(pl_t).round().long().cpu().numpy()
 
     def step(self, x: torch.Tensor, pl) -> torch.Tensor:
         """Matches WorldModel.step() signature exactly."""

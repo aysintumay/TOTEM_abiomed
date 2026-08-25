@@ -104,8 +104,12 @@ class ScalarBinQuantizer:
 
 
 class RewardQuantizer:
-    """Per-channel reward token quantizer (Eq 24). Only the MAP/HR/Pulsatility
-    channels carry a reward token; every other channel's token is 0.
+    """Three separate per-patch reward tokens (Eq 24-25: q_r^MAP, q_r^HR, q_r^Pulsat),
+    one value each, computed once per patch -- NOT a single per-channel-masked field.
+    Earlier version returned one (B, N) tensor nonzero only at each signal's own
+    channel row; Eq 25's token tuple explicitly lists all three reward components on
+    every channel's token, so all three must be available to broadcast onto every
+    channel, not just live in one row each.
 
     Penalty formulas mirror abiomed_env/reward_func.py's min_map_penalty,
     hypertention_penalty, hr_penalty, and pulsat_penalty exactly (same constants
@@ -135,10 +139,9 @@ class RewardQuantizer:
         return F.relu(7 * (20 - pulsat_min) / 20) + F.relu((pulsat_min - 50) / 20)
 
     def __call__(self, raw_patch):
-        """raw_patch: (B, N, k) unnormalized physiological units -> (B, N) LongTensor in {0,...,8}."""
-        B, N, _ = raw_patch.shape
-        q_r = torch.zeros(B, N, dtype=torch.long, device=raw_patch.device)
-
+        """raw_patch: (B, N, k) unnormalized physiological units -> three (B,) LongTensors,
+        each in {1,...,8} (r.clamp(-7, 0) + 8 -- 0 is never produced): (q_r_map, q_r_hr,
+        q_r_pulsat)."""
         map_patch = raw_patch[:, self.MAP_IDX, :]
         hr_patch = raw_patch[:, self.HR_IDX, :]
         pulsat_patch = raw_patch[:, self.PULSATILITY_IDX, :]
@@ -148,10 +151,10 @@ class RewardQuantizer:
         r_hr = -self._hr_penalty(hr_patch.min(dim=1).values)
         r_pulsat = -self._pulsat_penalty(pulsat_patch.min(dim=1).values)
 
-        q_r[:, self.MAP_IDX] = (r_map.clamp(-7, 0) + 8).round().long()
-        q_r[:, self.HR_IDX] = (r_hr.clamp(-7, 0) + 8).round().long()
-        q_r[:, self.PULSATILITY_IDX] = (r_pulsat.clamp(-7, 0) + 8).round().long()
-        return q_r
+        q_r_map = (r_map.clamp(-7, 0) + 8).round().long()
+        q_r_hr = (r_hr.clamp(-7, 0) + 8).round().long()
+        q_r_pulsat = (r_pulsat.clamp(-7, 0) + 8).round().long()
+        return q_r_map, q_r_hr, q_r_pulsat
 
 
 class GormpoTokenizer(BaseModel):
@@ -265,13 +268,16 @@ class GormpoTokenizer(BaseModel):
         q_max = self.q_max.quantize(patch_max)
         if self.reward_quantizer is not None:
             with torch.no_grad():
-                q_r = self.reward_quantizer(x)
+                q_r_map, q_r_hr, q_r_pulsat = self.reward_quantizer(x)
         else:
-            q_r = torch.zeros(B, N, dtype=torch.long, device=x.device)
+            q_r_map = q_r_hr = q_r_pulsat = torch.zeros(B, dtype=torch.long, device=x.device)
 
         return {
             "q_shape": q_shape, "q_mu": q_mu, "q_sigma": q_sigma,
-            "q_min": q_min, "q_max": q_max, "q_r": q_r,
+            "q_min": q_min, "q_max": q_max,
+            # One value per patch (Eq 24-25), not per channel -- same three reward
+            # values belong on every channel's token, unlike the affine/shape facets.
+            "q_r_map": q_r_map, "q_r_hr": q_r_hr, "q_r_pulsat": q_r_pulsat,
             "quantized": quantized, "vq_loss": vq_loss, "perplexity": perplexity,
             "mu": mu, "sigma": sigma, "x_bar": x_bar, "x_tilde": x_tilde,
         }

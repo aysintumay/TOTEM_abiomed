@@ -18,7 +18,12 @@ cormpo/common/buffer.py       # Replay buffer — RL only, not used by world mod
 predict(context_window, s_t, a_t) -> (s_t1_mean, s_t1_std)
 # context_window : list of K prior (s, a, s') transitions — passed in directly by the caller
 # s_t            : current state dict (variable names below)
-# a_t            : P-level integer (2–10)
+# a_t            : P-level action over the forecast horizon — one integer (2–10) per predicted
+#                  timestep (e.g. 6 values for a 6-step horizon), NOT a single scalar averaged
+#                  or held constant across the window. A single int is also accepted and is
+#                  then held constant across the horizon (rollout convenience), but the
+#                  reference Transformer digital twin (abiomed_env/model.py) always consumes
+#                  the full per-step trajectory, unpooled — that's the convention to match.
 # returns        : mean and std over next-state variables
 ```
 Output must cover all 12 state variables. Uncertainty via token log-probabilities or ensemble sampling.
@@ -46,10 +51,10 @@ Output must cover all 12 state variables. Uncertainty via token log-probabilitie
 Each variable's 6-timestep patch history is summarized as a discrete token, not a raw number —
 produced by the GORMPO tokenizer (`forecasting/lib/models/tokenizer.py`, a cross-channel-attention
 VQ-VAE; checkpoint at `forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000`). Each token
-has 8 parts, always in this fixed order, one row per variable:
+has 10 parts, always in this fixed order, one row per variable:
 
 ```
-c0 c1 c2 mu sigma min max reward
+c0 c1 c2 mu sigma min max r_map r_hr r_pulsat
 ```
 
 - `c0, c1, c2` — three integers in [0, 255], indices into a learned codebook of 256 morphological
@@ -59,17 +64,22 @@ c0 c1 c2 mu sigma min max reward
 - `mu, sigma, min, max` — each an integer bin in [0, 31]: the patch's mean/std/min/max value
   quantized into 32 quantile bins (Eq 20-23), ordered low(0)→high(31) within that variable's own
   observed training range. Unlike the shape codes, these ARE ordinal.
-- `reward` — integer in [0, 8] (Eq 24). Only meaningful for PumpPressure (used as MAP), Heart Rate,
-  and PULSAT; 0 for every other row. 1-8 encodes increasing clinical instability risk (standard
-  MAP/HR/pulsatility thresholds). Context only, never predicted.
+- `r_map, r_hr, r_pulsat` — three integers in {1, ..., 8} (Eq 24-25; never 0 -- that value only
+  ever meant "not applicable" in the old per-channel encoding, which no longer applies now that
+  all three are always computed per patch), one per clinical reward signal
+  (based on PumpPressure/MAP, Heart Rate, and PULSAT respectively). These are the SAME three values
+  on every row regardless of which variable that row describes — they summarize the whole patch's
+  clinical stability, not just the named channel's own row. 8 = no penalty (stable), 1 = maximally
+  unstable (clamped). Context only, never predicted.
 
 Feature order (row 0-10 in every context/prediction block; Pump Level excluded — it's the action):
 PumpPressure, PumpSpeed, PumpFlow, LVP, LVEDP, SYSTOLIC, DIASTOLIC, PULSAT, PumpCurrent, Heart Rate,
 ESE_lv.
 
 Task: given `forecast_horizon` timesteps of context (tokenized as 11 rows in the format above) plus
-a new Pump Level action, predict the next patch's token for each of the 11 variables as
-`c0 c1 c2 mu sigma min max` (7 integers, no reward).
+the chosen Pump Level for each of the next `forecast_horizon` steps (a per-step action sequence,
+not one value held constant — see Interface contract above), predict the next patch's token for
+each of the 11 variables as `c0 c1 c2 mu sigma min max` (7 integers, no reward).
 
 ## Action space
 P-level ∈ {2, 3, 4, 5, 6, 7, 8, 9, 10}. Higher P = more support, higher RPM/flow, lower LV preload.

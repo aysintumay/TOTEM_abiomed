@@ -1,8 +1,11 @@
 """
-python visualize_predictions.py
+python visualize_predictions_qwen_fewshot.py
 Plots ground truth vs GORMPO few-shot LLM world model predictions for a few test
-samples, all 12 variables (11 physiological + Pump Level as the action/context
-panel -- it's not forecast, but shown for completeness since it's part of state).
+samples, using Qwen2.5-7B-Instruct (base, no fine-tuning) instead of medllama --
+identical to visualize_predictions.py otherwise (same MODEL_ID-generic
+GormpoFewShotWorldModel, same k_shot/num_samples the full-test-set eval used, same
+sample indices, same fixed y-limits) so figures are directly comparable panel-for-panel
+against every other model's figures, including visualize_predictions.py's own.
 """
 import os
 
@@ -14,21 +17,17 @@ from gormpo_world_model import FEATURE_NAMES, GormpoFewShotWorldModel, compute_v
 
 DATA_PATH = "/public/gormpo/10min_1hr_all_data.pkl"
 TOKENIZER_PATH = "forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000/checkpoints/final_tokenizer.pth"
-MODEL_ID = "m42-health/Llama3-Med42-8B"
-DEVICE = "cuda:3"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+DEVICE = "cuda:6"
 K_SHOT = 3
-NUM_SAMPLES = 3
-SAMPLE_IDXS = [0, 1, 2, 3]  # which test samples to visualize
+NUM_SAMPLES = 3  # matches the full-test-set eval run
+SAMPLE_IDXS = [0, 1, 2, 3]  # same test samples as every other visualize_predictions* script
 OUT_DIR = "figures"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Fixed, model-independent per-variable y-axis bounds (1st/99th training percentile),
-# shared with GormpoFewShotWorldModel's own output-clipping bounds (see
-# gormpo_world_model.py::compute_variable_ylims). Applying the SAME dict here on every
-# panel, regardless of sample or model, is what makes figures from different models
-# directly comparable -- any other model's visualization script should import and use
-# this exact same function/data_path rather than computing its own ranges.
+# Same fixed, model-independent per-variable y-axis bounds every other visualize_predictions*
+# script uses -- what makes all these figures directly comparable panel-for-panel.
 YLIMS = compute_variable_ylims(DATA_PATH)
 
 model = GormpoFewShotWorldModel(
@@ -49,7 +48,7 @@ for idx in SAMPLE_IDXS:
     # unnormalize everything to physical units
     ctx_phys = model.unnorm_output(context)                        # (6, 12)
     pred_phys = model.unnorm_output(mean_norm)                     # (6, 12)
-    std_phys = std_norm.float() * model.std[model.columns].cpu()   # (6, 12) — scale only
+    std_phys = std_norm.float() * model.std[model.columns].cpu()   # (6, 12) -- scale only
 
     # ground truth future: y is (66,) = (6, 11) normalized (no pump level)
     y_norm = torch.as_tensor(np.asarray(y)).float().reshape(6, 11)
@@ -65,7 +64,7 @@ for idx in SAMPLE_IDXS:
     nrows = (n_features + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(16, nrows * 3))
     axes = axes.flatten()
-    fig.suptitle(f"Test sample {idx}  |  P-level action = {pl_int}  |  GORMPO few-shot ({MODEL_ID})", fontsize=12)
+    fig.suptitle(f"Test sample {idx}  |  P-level action = {pl_int}  |  Qwen2.5-7B few-shot (k={K_SHOT}) ({MODEL_ID})", fontsize=12)
 
     for j in range(11):
         ax = axes[j]
@@ -93,15 +92,14 @@ for idx in SAMPLE_IDXS:
     ax.plot(t_pred, [pl_int] * len(t_pred), color="black", marker="s", markersize=3,
             linestyle="-", label="action (fixed)")
     ax.axvline(0, color="gray", linestyle=":", linewidth=0.8)
-    ax.set_ylim(*YLIMS[FEATURE_NAMES[11]])  # fixed (1, 11): P-level's natural range (2-10);
-    # avoids a confusing floating-point-noise auto-scale when context is ~constant.
+    ax.set_ylim(*YLIMS[FEATURE_NAMES[11]])
     ax.set_title(f"{FEATURE_NAMES[11]} (action, not forecast)", fontsize=9)
     ax.set_xlabel("time (min)", fontsize=8)
     ax.tick_params(labelsize=7)
     ax.legend(fontsize=7)
 
     plt.tight_layout()
-    path = os.path.join(OUT_DIR, f"gormpo_sample_{idx:03d}.png")
+    path = os.path.join(OUT_DIR, f"qwen_fewshot_sample_{idx:03d}.png")
     plt.savefig(path, dpi=120)
     plt.close()
     print(f"Saved {path}")

@@ -29,6 +29,9 @@ from lib.utils.checkpoint import EarlyStopping
 from lib.utils.env import seed_all_rng
 
 SCALAR_NAMES = ("mu", "sigma", "min", "max")
+# Three separate per-patch reward fields (Eq 24-25), replacing the old single "r" --
+# see tokenizer.py's RewardQuantizer and extract_gormpo_tokens.py.
+REWARD_NAMES = ("r_map", "r_hr", "r_pulsat")
 
 
 def create_gormpo_dataloader(datapath, batchsize, num_workers=4):
@@ -42,8 +45,13 @@ def create_gormpo_dataloader(datapath, batchsize, num_workers=4):
         y_orig = _load("y_original", torch.float32)
         x_codes = _load("x_codes", torch.int64)
         y_codes = _load("y_codes", torch.int64)
+        N = x_codes.shape[-1]
+
         scalars = [_load(f"x_{s}", torch.int64) for s in SCALAR_NAMES]
-        scalars += [_load("x_r", torch.int64)]
+        # reward is stored per-patch (num_episodes,), not per-channel like the other
+        # scalars -- broadcast to (num_episodes, N) so every channel's row sees the
+        # same three reward values, matching how embed() sums them onto every row.
+        scalars += [_load(f"x_{s}", torch.int64).unsqueeze(1).expand(-1, N).contiguous() for s in REWARD_NAMES]
         scalars += [_load(f"y_{s}", torch.int64) for s in SCALAR_NAMES]
 
         dataset = TensorDataset(x_orig, y_orig, x_codes, y_codes, *scalars)
@@ -55,10 +63,10 @@ def create_gormpo_dataloader(datapath, batchsize, num_workers=4):
 
 
 def _unpack(data, device):
-    x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, y_mu, y_sigma, y_min, y_max = (
-        t.to(device) for t in data
-    )
-    return x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, y_mu, y_sigma, y_min, y_max
+    (x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+     x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max) = (t.to(device) for t in data)
+    return (x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+            x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max)
 
 
 def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scalar_loss_weight, grad_accum_steps=1):
@@ -68,18 +76,21 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
     optimizer.zero_grad()
 
     for i, data in enumerate(dataloader):
-        (_, _, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, y_mu, y_sigma, y_min, y_max) = _unpack(data, device)
+        (_, _, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+         x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max) = _unpack(data, device)
         B, TCin, N = x_codes.shape
 
         x_ids = flatten_channels(x_codes)  # (B*N, TCin)
         y_ids = flatten_channels(y_codes)  # (B*N, TCout)
-        x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f = (
-            flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r)
+        x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f = (
+            flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat)
         )
         y_scalars_f = {name: flatten_channels_scalar(t) for name, t in zip(SCALAR_NAMES, (y_mu, y_sigma, y_min, y_max))}
 
         inputs, labels = build_training_sequence(x_ids, y_ids)
-        shape_logits, hidden = model(inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f, TCin=TCin)
+        shape_logits, hidden = model(
+            inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, TCin=TCin
+        )
         loss_shape = F.cross_entropy(
             shape_logits.reshape(-1, shape_logits.shape[-1]), labels.reshape(-1), ignore_index=-100
         )
@@ -127,16 +138,19 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
 @torch.no_grad()
 def inference(data, model, tokenizer, device):
     """Returns (pred_time, labels_time), both (B, patch_len, N) raw physiological units."""
-    (x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r, _, _, _, _) = _unpack(data, device)
+    (x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+     x_r_map, x_r_hr, x_r_pulsat, _, _, _, _) = _unpack(data, device)
     B, TCin, N = x_codes.shape
     TCout = y_codes.shape[1]
 
     x_ids = flatten_channels(x_codes)
-    x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f = (
-        flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r)
+    x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f = (
+        flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat)
     )
 
-    y_ids_pred, scalars_pred = model.generate_codes(x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f)
+    y_ids_pred, scalars_pred = model.generate_codes(
+        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f
+    )
 
     mu_idx = unflatten_channels_scalar(scalars_pred["mu"].argmax(dim=-1), B, N)
     sigma_idx = unflatten_channels_scalar(scalars_pred["sigma"].argmax(dim=-1), B, N)

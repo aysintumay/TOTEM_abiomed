@@ -124,7 +124,11 @@ class GormpoTokenLLMForecaster(BaseModel):
         self.sigma_embedding = _emb(num_bins)
         self.min_embedding = _emb(num_bins)
         self.max_embedding = _emb(num_bins)
-        self.reward_embedding = _emb(num_reward_bins)
+        # Three separate per-patch reward embeddings (Eq 24-25: q_r_map/q_r_hr/q_r_pulsat),
+        # replacing the old single reward_embedding -- see tokenizer.py's RewardQuantizer.
+        self.reward_map_embedding = _emb(num_reward_bins)
+        self.reward_hr_embedding = _emb(num_reward_bins)
+        self.reward_pulsat_embedding = _emb(num_reward_bins)
 
         # Target-patch scalar heads (Eq 28's "predicted scale statistics"), read off the
         # hidden state at the context/target boundary.
@@ -133,30 +137,36 @@ class GormpoTokenLLMForecaster(BaseModel):
         self.min_head = _head(num_bins)
         self.max_head = _head(num_bins)
 
-    def embed(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None, x_r=None, TCin=None):
-        """input_ids: (N, L) shape codes. x_mu/x_sigma/x_min/x_max/x_r: (N,) context-patch
-        scalar bin indices, broadcast-added to the first TCin positions only (the
-        context/x-half); absent entirely from target/y-half positions."""
+    def embed(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None,
+              x_r_map=None, x_r_hr=None, x_r_pulsat=None, TCin=None):
+        """input_ids: (N, L) shape codes. x_mu/x_sigma/x_min/x_max/x_r_map/x_r_hr/
+        x_r_pulsat: (N,) context-patch scalar bin indices, broadcast-added to the first
+        TCin positions only (the context/x-half); absent entirely from target/y-half
+        positions. The three reward fields are per-patch, not per-channel (see
+        tokenizer.py's RewardQuantizer) -- callers broadcast them to (N,) across
+        channels before flattening, same as train_gormpo_llm_forecaster.py does."""
         code_embeds = self.code_embedding(input_ids)  # (N, L, H)
         if TCin is not None and x_mu is not None:
             scalar_sum = (
                 self.mu_embedding(x_mu) + self.sigma_embedding(x_sigma)
                 + self.min_embedding(x_min) + self.max_embedding(x_max)
-                + self.reward_embedding(x_r)
+                + self.reward_map_embedding(x_r_map) + self.reward_hr_embedding(x_r_hr)
+                + self.reward_pulsat_embedding(x_r_pulsat)
             )  # (N, H)
             pad = torch.zeros_like(code_embeds)
             pad[:, :TCin, :] = scalar_sum.unsqueeze(1)
             code_embeds = code_embeds + pad
         return code_embeds
 
-    def forward(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None, x_r=None, TCin=None):
+    def forward(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None,
+                x_r_map=None, x_r_hr=None, x_r_pulsat=None, TCin=None):
         """
         Returns:
             shape_logits: (N, L, num_embeddings)
             hidden_states: (N, L, hidden_size) -- index [:, TCin - 1, :] is the
                 context/target boundary representation used by predict_scalars().
         """
-        inputs_embeds = self.embed(input_ids, x_mu, x_sigma, x_min, x_max, x_r, TCin)
+        inputs_embeds = self.embed(input_ids, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, TCin)
         out = self.backbone(inputs_embeds=inputs_embeds, use_cache=False)
         shape_logits = self.shape_head(out.last_hidden_state)
         return shape_logits, out.last_hidden_state
@@ -172,12 +182,13 @@ class GormpoTokenLLMForecaster(BaseModel):
         }
 
     @torch.no_grad()
-    def generate_codes(self, x_ids, TCout, x_mu, x_sigma, x_min, x_max, x_r):
+    def generate_codes(self, x_ids, TCout, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat):
         """
         Args:
             x_ids: (N, TCin) context shape codes
             TCout: number of future shape codes to generate
-            x_mu, x_sigma, x_min, x_max, x_r: (N,) context-patch scalar bin indices
+            x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat: (N,) context-patch
+                scalar bin indices
         Returns:
             y_ids: (N, TCout) generated shape codes
             scalars: dict of (N, num_bins) logits, predicted once from the context
@@ -187,7 +198,9 @@ class GormpoTokenLLMForecaster(BaseModel):
         generated = x_ids
         boundary_hidden = None
         for step in range(TCout):
-            shape_logits, hidden = self.forward(generated, x_mu, x_sigma, x_min, x_max, x_r, TCin=TCin)
+            shape_logits, hidden = self.forward(
+                generated, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, TCin=TCin
+            )
             if step == 0:
                 boundary_hidden = hidden[:, TCin - 1, :]
             next_id = torch.argmax(shape_logits[:, -1, :], dim=-1, keepdim=True)

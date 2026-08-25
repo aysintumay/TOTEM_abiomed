@@ -50,7 +50,11 @@ def run(hf_model, num_embeddings, num_bins):
     x_sigma = torch.randint(0, num_bins, (B, N))
     x_min = torch.randint(0, num_bins, (B, N))
     x_max = torch.randint(0, num_bins, (B, N))
-    x_r = torch.randint(0, 9, (B, N))
+    # Three separate per-patch reward fields (Eq 24-25), broadcast to (B, N) same as a
+    # real dataloader would (see train_gormpo_llm_forecaster.py::create_gormpo_dataloader).
+    x_r_map = torch.randint(1, 9, (B, N))
+    x_r_hr = torch.randint(1, 9, (B, N))
+    x_r_pulsat = torch.randint(1, 9, (B, N))
     y_mu = torch.randint(0, num_bins, (B, N))
     y_sigma = torch.randint(0, num_bins, (B, N))
     y_min = torch.randint(0, num_bins, (B, N))
@@ -58,8 +62,8 @@ def run(hf_model, num_embeddings, num_bins):
 
     x_ids = flatten_channels(codeids_x)  # (B*N, TCin)
     y_ids = flatten_channels(codeids_y)  # (B*N, TCout)
-    x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f = (
-        flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r)
+    x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f = (
+        flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat)
     )
     y_mu_f, y_sigma_f, y_min_f, y_max_f = (
         flatten_channels_scalar(t) for t in (y_mu, y_sigma, y_min, y_max)
@@ -69,7 +73,9 @@ def run(hf_model, num_embeddings, num_bins):
     inputs, labels = build_training_sequence(x_ids, y_ids)
     assert inputs.shape == (B * N, TCin + TCout - 1)
 
-    shape_logits, hidden = model(inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f, TCin=TCin)
+    shape_logits, hidden = model(
+        inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, TCin=TCin
+    )
     assert shape_logits.shape == (B * N, TCin + TCout - 1, num_embeddings)
     assert hidden.shape == (B * N, TCin + TCout - 1, model.hidden_size)
 
@@ -105,7 +111,9 @@ def run(hf_model, num_embeddings, num_bins):
     print("gradient check OK: LoRA + all new embeddings/heads trainable, base backbone frozen")
 
     # ----- autoregressive generation + scalar prediction ----- #
-    y_ids_pred, gen_scalars = model.generate_codes(x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_f)
+    y_ids_pred, gen_scalars = model.generate_codes(
+        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f
+    )
     assert y_ids_pred.shape == (B * N, TCout)
     assert (y_ids_pred >= 0).all() and (y_ids_pred < num_embeddings).all()
     for name in ("mu", "sigma", "min", "max"):

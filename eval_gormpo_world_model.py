@@ -52,8 +52,11 @@ def main(args):
         for i in chunk:
             x, pl, y = model.data_test[i]
             contexts.append(torch.tensor(np.asarray(x), dtype=torch.float32))
-            pl_raw = float(np.asarray(pl).mean())
-            p_levels.append(int(round(pl_raw * model.std[-1].item() + model.mean[-1].item())))
+            # pl is the true per-step P-level trajectory over the forecast horizon (the
+            # action), not a single value -- previously collapsed via .mean() before ever
+            # reaching the prompt, discarding any real within-window P-level change.
+            pl_norm = np.asarray(pl, dtype=np.float32).reshape(-1)
+            p_levels.append(np.round(pl_norm * model.std[-1].item() + model.mean[-1].item()).astype(int))
             # y is already z-score normalized (TimeSeriesDataset's own output, same mean/std
             # as context_norm) -- (66,) = (forecast_horizon, 11), no Pump Level column.
             y_norms.append(np.asarray(y, dtype=np.float32).reshape(model.forecast_horizon, model.num_channels - 1))
