@@ -58,8 +58,13 @@ def main(args):
             pl_norm = np.asarray(pl, dtype=np.float32).reshape(-1)
             p_levels.append(np.round(pl_norm * model.std[-1].item() + model.mean[-1].item()).astype(int))
             # y is already z-score normalized (TimeSeriesDataset's own output, same mean/std
-            # as context_norm) -- (66,) = (forecast_horizon, 11), no Pump Level column.
-            y_norms.append(np.asarray(y, dtype=np.float32).reshape(model.forecast_horizon, model.num_channels - 1))
+            # as context_norm) -- (66,) = (forecast_horizon, 11), no Pump Level column. pl is
+            # the real realized P-level trajectory for this same window (the action IS the
+            # ground truth here, by construction) -- append it as the 12th column, in the
+            # same normalized space, since the model now predicts Pump Level like any other
+            # channel and its accuracy against the real trajectory is a reportable metric.
+            y_norm_11 = np.asarray(y, dtype=np.float32).reshape(model.forecast_horizon, model.num_channels - 1)
+            y_norms.append(np.concatenate([y_norm_11, pl_norm.reshape(model.forecast_horizon, 1)], axis=1))
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -68,18 +73,26 @@ def main(args):
         print(printed, end="")
         n_fallback += printed.count(BEFORE_FALLBACK_MARKER)
 
+        # Per-feature calls mean 12x more generate() calls per episode than before, each
+        # on a slightly different padded sequence length (the token text's digit count
+        # varies). Observed in practice: GPU memory allocated by PyTorch grows batch over
+        # batch across a long run and eventually OOMs outright (not just reserved-cache
+        # fragmentation) at the same ~384-episode mark on two independent runs -- clearing
+        # the allocator's cache after every batch keeps usage flat instead of climbing.
+        torch.cuda.empty_cache()
+
         # mean_norm is already normalized (that's predict()'s own output space); compare
         # directly, no unnorm -- errors here are in the same z-score units for every
         # channel, so they're comparable across channels of wildly different physical
         # scale (e.g. PumpSpeed ~4000 RPM vs. ESE_lv ~0.5 mmHg/mL).
         for (mean_norm, std_norm), y_norm in zip(batch_results, y_norms):
-            all_pred.append(mean_norm.numpy()[:, :-1])  # drop Pump Level column, (T, 11)
+            all_pred.append(mean_norm.numpy())  # (T, 12) -- Pump Level is now a genuine prediction, not dropped
             all_true.append(y_norm)
 
         print(f"[{min(chunk_start + args.batch_size, n)}/{n}] examples done (batch of {len(chunk)})")
 
-    pred = torch.tensor(np.stack(all_pred), dtype=torch.float32)  # (n, T, 11)
-    true = torch.tensor(np.stack(all_true), dtype=torch.float32)  # (n, T, 11)
+    pred = torch.tensor(np.stack(all_pred), dtype=torch.float32)  # (n, T, 12)
+    true = torch.tensor(np.stack(all_true), dtype=torch.float32)  # (n, T, 12)
 
     if args.output_npz:
         # raw per-episode predictions, not pre-averaged metrics: merge_shards.py
@@ -88,8 +101,8 @@ def main(args):
         np.savez(args.output_npz, pred=pred.numpy(), true=true.numpy(), n_fallback=n_fallback, n=n)
         print(f"Saved shard predictions to {args.output_npz}")
 
-    mae = (pred - true).abs().mean(dim=(0, 1))          # (11,)
-    mse = (pred - true).pow(2).mean(dim=(0, 1))          # (11,)
+    mae = (pred - true).abs().mean(dim=(0, 1))          # (12,)
+    mse = (pred - true).pow(2).mean(dim=(0, 1))          # (12,)
     # pearsoncor/dtw reduce over the whole (B, S) grid with "sum"/"mean" -- call
     # per-channel (S=1 slice) to keep the per-variable breakdown, averaging each
     # channel's correlation/DTW across all n samples.
@@ -103,10 +116,10 @@ def main(args):
     ])
 
     print("\n=== Per-variable MAE / MSE / DTW / Pearson corr (normalized/z-score units, averaged over all samples) ===")
-    for j in range(model.num_channels - 1):
+    for j in range(model.num_channels):
         print(f"  {FEATURE_NAMES[j]:<14} MAE={mae[j]:7.4f}  MSE={mse[j]:7.4f}  DTW={dtw_dist[j]:7.4f}  corr={corr[j]:7.4f}")
     print(
-        f"\nOverall (mean across all 11 variables): "
+        f"\nOverall (mean across all 12 variables, incl. Pump Level): "
         f"MAE={mae.mean():.4f}  MSE={mse.mean():.4f}  DTW={dtw_dist.mean():.4f}  corr={corr.mean():.4f}"
     )
     print(f"Fallback rate: {n_fallback}/{n} examples had all samples unparseable")

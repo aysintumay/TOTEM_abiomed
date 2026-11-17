@@ -32,6 +32,36 @@ SCALAR_NAMES = ("mu", "sigma", "min", "max")
 # Three separate per-patch reward fields (Eq 24-25), replacing the old single "r" --
 # see tokenizer.py's RewardQuantizer and extract_gormpo_tokens.py.
 REWARD_NAMES = ("r_map", "r_hr", "r_pulsat")
+# Pump Level is channel 11 of 12 (see abiomed_env/model.py's `columns`/FEATURE_NAMES
+# ordering) -- the *action*, not something to forecast. It's split out of the
+# channel set below and its target-patch mu instead becomes a conditioning input
+# (GormpoTokenLLMForecaster.future_action_embedding), matching how the ICL world
+# model (gormpo_world_model.py) is given the next-window P-level as a known input
+# rather than asked to predict it. Without this split, the model has no way to
+# answer "what happens if P-level is set to X" -- it would just forecast its own
+# guess of P-level jointly with the 11 physiological channels, not usable as an
+# MBRL world model queried with a specific chosen action.
+PL_CHANNEL = 11
+
+
+def split_action_channel(y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+                          x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max):
+    """Drops Pump Level (channel PL_CHANNEL) from the 12-channel forecast set (now 11
+    physiological channels only) and pulls the given future action from y_orig's own
+    raw Pump Level column directly -- a natural small integer (2-10), not routed
+    through the generic 32-bin ScalarBinQuantizer (q_mu) built for continuous vitals,
+    which would just lossily rebin something already discrete. Kept at full per-
+    timestep resolution (B, patch_len), NOT collapsed to the patch's mean level --
+    P-level can ramp within a 6-step window, and the ICL world model is given the
+    whole per-step sequence in its prompt, not a single summary value; collapsing
+    here would make this model's conditioning silently weaker and not a fair
+    comparison. All (..., 12) inputs -> (..., 11) plus one extra (B, patch_len)
+    zero-indexed action tensor (level - 2)."""
+    y_action = y_orig[:, :, PL_CHANNEL].round().clamp(2, 10).long() - 2  # (B, patch_len)
+    keep = [i for i in range(x_codes.shape[-1]) if i != PL_CHANNEL]
+    sliced = (t[:, :, keep] if t.dim() == 3 else t[:, keep] for t in
+              (x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max))
+    return (*sliced, y_action)
 
 
 def create_gormpo_dataloader(datapath, batchsize, num_workers=4):
@@ -76,9 +106,14 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
     optimizer.zero_grad()
 
     for i, data in enumerate(dataloader):
-        (_, _, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
+        (_, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
          x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max) = _unpack(data, device)
-        B, TCin, N = x_codes.shape
+        (x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat,
+         y_mu, y_sigma, y_min, y_max, y_action) = split_action_channel(
+            y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat,
+            y_mu, y_sigma, y_min, y_max,
+        )
+        B, TCin, N = x_codes.shape  # N=11 physiological channels now (Pump Level split out)
 
         x_ids = flatten_channels(x_codes)  # (B*N, TCin)
         y_ids = flatten_channels(y_codes)  # (B*N, TCout)
@@ -86,16 +121,25 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
             flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat)
         )
         y_scalars_f = {name: flatten_channels_scalar(t) for name, t in zip(SCALAR_NAMES, (y_mu, y_sigma, y_min, y_max))}
+        # y_action is (B, patch_len) -- broadcast across the N=11 channel rows (same
+        # convention as the per-patch reward fields), keeping the per-timestep axis.
+        y_action_f = y_action.unsqueeze(1).expand(-1, N, -1).reshape(-1, y_action.shape[-1])
 
         inputs, labels = build_training_sequence(x_ids, y_ids)
         shape_logits, hidden = model(
-            inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, TCin=TCin
+            inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f,
+            y_action_f, TCin=TCin,
         )
+        # shape_logits/hidden are (B*N, action_len + TCin+TCout-1, ...) -- the leading
+        # action_len positions are the given action (its own sequence positions now, see
+        # GormpoTokenLLMForecaster.embed()), never a prediction target; drop them before
+        # comparing against labels, which only cover the original TCin+TCout-1 codes.
+        shape_logits = shape_logits[:, model.action_len:, :]
         loss_shape = F.cross_entropy(
             shape_logits.reshape(-1, shape_logits.shape[-1]), labels.reshape(-1), ignore_index=-100
         )
 
-        boundary_hidden = hidden[:, TCin - 1, :]
+        boundary_hidden = hidden[:, model.action_len + TCin - 1, :]
         scalars_pred = model.predict_scalars(boundary_hidden)
         loss_scalar = sum(F.cross_entropy(scalars_pred[name], y_scalars_f[name]) for name in SCALAR_NAMES)
 
@@ -137,19 +181,28 @@ def train_one_epoch(dataloader, model, optimizer, scheduler, epoch, device, scal
 
 @torch.no_grad()
 def inference(data, model, tokenizer, device):
-    """Returns (pred_time, labels_time), both (B, patch_len, N) raw physiological units."""
+    """Returns (pred_time, labels_time), both (B, patch_len, N) raw physiological units,
+    N=11 -- Pump Level is excluded from both: it's given as the conditioning action
+    (from the real episode, same counterfactual-eval convention as the ICL path), not
+    forecasted, so there's nothing of the model's own to score for that channel."""
     (x_orig, y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max,
-     x_r_map, x_r_hr, x_r_pulsat, _, _, _, _) = _unpack(data, device)
-    B, TCin, N = x_codes.shape
+     x_r_map, x_r_hr, x_r_pulsat, y_mu, y_sigma, y_min, y_max) = _unpack(data, device)
+    (x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat,
+     y_mu, y_sigma, y_min, y_max, y_action) = split_action_channel(
+        y_orig, x_codes, y_codes, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat,
+        y_mu, y_sigma, y_min, y_max,
+    )
+    B, TCin, N = x_codes.shape  # N=11
     TCout = y_codes.shape[1]
 
     x_ids = flatten_channels(x_codes)
     x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f = (
         flatten_channels_scalar(t) for t in (x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat)
     )
+    y_action_f = y_action.unsqueeze(1).expand(-1, N, -1).reshape(-1, y_action.shape[-1])
 
     y_ids_pred, scalars_pred = model.generate_codes(
-        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f
+        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, y_action_f
     )
 
     mu_idx = unflatten_channels_scalar(scalars_pred["mu"].argmax(dim=-1), B, N)
@@ -164,7 +217,9 @@ def inference(data, model, tokenizer, device):
 
     x_hat, _ = tokenizer.decode(quantized, mu_hat, sigma_hat)  # (B, N, patch_len)
     pred_time = x_hat.transpose(1, 2)  # (B, patch_len, N)
-    return pred_time, y_orig
+    keep = [i for i in range(y_orig.shape[-1]) if i != PL_CHANNEL]
+    labels_time = y_orig[:, :, keep]  # (B, patch_len, 11) -- drop Pump Level to match pred_time
+    return pred_time, labels_time
 
 
 def run_eval(dataloader, model, tokenizer, device, tag, save_file):

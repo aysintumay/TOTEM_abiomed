@@ -21,6 +21,16 @@ examples are what let it ground codes to outcomes in context.
 Tokenizer used: the from-scratch, MCS-specialist tokenizer that showed no
 overfitting across 2000 epochs of training (saved_models/gormpo_tokenizer_mcs_scratch_long2000
 in the forecasting/ tree) -- NOT the frozen-generalist-encoder variant.
+
+One LLM call per feature: context is the full 12-row state (incl. Pump Level's own
+history) and the action is the next forecast_horizon steps' chosen Pump Level (a
+separate, forward-looking input, not a context row), but the prediction side issues
+12 separate queries -- one per channel, each asking for exactly that channel's next
+token row -- rather than one call producing all 12 rows together. This replaced an
+earlier one-call-does-everything design once it was diagnosed (diagnose_qwen_fallback.py)
+that some models lose track of which row they're on partway through a long multi-row
+generation and start repeating an earlier row verbatim; a single-row generation has
+nothing earlier in the same response to loop back to.
 """
 
 import os
@@ -114,8 +124,6 @@ class GormpoFewShotWorldModel:
         self._train_ctx_phys = None    # (N, T, 12) context, physical units
         self._train_fc_phys = None     # (N, T, 12) forecast incl. PL, physical units
         self._train_pl_int = None      # (N,) P-level int
-        self._phys_low = None          # (11,) 1st-percentile clipping bound per variable
-        self._phys_high = None         # (11,) 99th-percentile clipping bound per variable
 
         print(f"Loading GORMPO tokenizer: {tokenizer_path}")
         self.gormpo_tokenizer = torch.load(tokenizer_path, map_location="cpu", weights_only=False)
@@ -178,10 +186,6 @@ class GormpoFewShotWorldModel:
             f" val: {len(self.data_val)}"
             f" test: {len(self.data_test)}"
         )
-
-        self.ylims = compute_variable_ylims(path)  # {feature_name: (low, high)}, model-independent
-        self._phys_low = np.array([self.ylims[n][0] for n in FEATURE_NAMES[:-1]], dtype=np.float32)
-        self._phys_high = np.array([self.ylims[n][1] for n in FEATURE_NAMES[:-1]], dtype=np.float32)
 
         if self.k_shot > 0:
             self._build_retrieval_index()
@@ -279,19 +283,32 @@ class GormpoFewShotWorldModel:
         x = x.to(self.gormpo_tokenizer.vq._embedding.weight.device)
         return self.gormpo_tokenizer.encode(x)
 
+    def _dequantize_for_channels(self, quantizer, idx, channels) -> torch.Tensor:
+        """ScalarBinQuantizer.dequantize picks each channel's bin table by COLUMN
+        POSITION, so a (1, 1) index would always be decoded with channel 0's
+        (PumpPressure's) bins. Scatter into a full-width (1, num_channels) index, then
+        read back only the requested channels' columns."""
+        full = torch.zeros(1, self.num_channels, dtype=torch.long, device=idx.device)
+        full[0, channels] = idx
+        return quantizer.dequantize(full)[:, channels]  # (1, len(channels))
+
     @torch.no_grad()
-    def _detokenize_channels(self, q_shape_per_channel, q_mu_per_channel, q_sigma_per_channel) -> np.ndarray:
+    def _detokenize_channels(self, q_shape_per_channel, q_mu_per_channel, q_sigma_per_channel, channels=None) -> np.ndarray:
         """
         q_shape_per_channel: (N, L) predicted shape code indices
         q_mu_per_channel, q_sigma_per_channel: (N,) predicted scale bin indices
+        channels: the N FEATURE_NAMES indices these rows belong to (default: all, in order)
+        -- needed so each row is dequantized with its own variable's bin table.
         Returns (patch_len, N) physical units, time-major.
         """
         device = self.gormpo_tokenizer.vq._embedding.weight.device
+        if channels is None:
+            channels = list(range(self.num_channels))
         q_shape = torch.as_tensor(q_shape_per_channel, dtype=torch.long, device=device)
-        mu_idx = torch.as_tensor(q_mu_per_channel, dtype=torch.long, device=device).unsqueeze(0)
-        sigma_idx = torch.as_tensor(q_sigma_per_channel, dtype=torch.long, device=device).unsqueeze(0)
-        mu_hat = self.gormpo_tokenizer.q_mu.dequantize(mu_idx)
-        sigma_hat = self.gormpo_tokenizer.q_sigma.dequantize(sigma_idx)
+        mu_idx = torch.as_tensor(q_mu_per_channel, dtype=torch.long, device=device)
+        sigma_idx = torch.as_tensor(q_sigma_per_channel, dtype=torch.long, device=device)
+        mu_hat = self._dequantize_for_channels(self.gormpo_tokenizer.q_mu, mu_idx, channels)
+        sigma_hat = self._dequantize_for_channels(self.gormpo_tokenizer.q_sigma, sigma_idx, channels)
 
         N, L = q_shape.shape
         codebook = self.gormpo_tokenizer.vq._embedding.weight  # (num_embeddings, code_dim)
@@ -305,15 +322,25 @@ class GormpoFewShotWorldModel:
 
     # mcs.md is the single source of truth for both the physiology/task spec and the
     # GORMPO tokenization scheme (see its "Tokenization (GORMPO)" section) -- read
-    # once per process, not re-parsed on every prompt build.
+    # once per process, not re-parsed on every prompt build. Sections aimed at human
+    # developers (repo layout, Python interface) are dropped -- they say nothing about
+    # the physiology or the token format and only dilute the prompt.
     _MCS_MD_PATH = os.path.join(_ROOT, "mcs.md")
+    _MCS_MD_EXCLUDED_SECTIONS = {"Codebase structure", "Interface contract"}
     _mcs_md_cache = None
 
     @classmethod
     def _load_mcs_md(cls) -> str:
         if cls._mcs_md_cache is None:
             with open(cls._MCS_MD_PATH, "r") as f:
-                cls._mcs_md_cache = f.read()
+                text = f.read()
+            # split on "## " headings; chunk 0 is the "# " title preamble
+            chunks = re.split(r"(?m)^(?=## )", text)
+            kept = [
+                c for c in chunks
+                if not (c.startswith("## ") and c[3:].splitlines()[0].strip() in cls._MCS_MD_EXCLUDED_SECTIONS)
+            ]
+            cls._mcs_md_cache = "".join(kept)
         return cls._mcs_md_cache
 
     def _build_system_prompt(self) -> str:
@@ -323,52 +350,62 @@ class GormpoFewShotWorldModel:
             "you will read and must produce:\n\n"
             f"{self._load_mcs_md()}\n\n"
             "=== TASK ===\n"
-            f"You receive {self.forecast_horizon} timesteps of context, tokenized as 11 rows (one per "
-            "variable, Pump Level excluded since it's the action) in the format above, then the chosen "
-            f"Pump Level for EACH of the next {self.forecast_horizon} steps (one value per step, not a "
-            "single action held constant -- it can change within the window). Predict the NEXT patch's "
-            "token for each of the 11 variables: c0 c1 c2 mu sigma min max (7 integers, no reward).\n"
-            "A few worked examples (similar past situations and what actually happened next) are given "
-            "before the real query -- use them to infer what the codes and bins mean in context.\n\n"
-            "Return ONLY 11 rows, one per line, 7 space-separated integers each, no labels, no "
-            "explanations, no markdown -- nothing else."
+            f"You receive {self.forecast_horizon} timesteps of context, tokenized as 12 rows (the full "
+            "state, one per variable, including Pump Level's own recent history as the 12th row) in the "
+            "format above, followed by one line with the context patch's 3 reward bins "
+            "(r_map r_hr r_pulsat). You are also given the action: the chosen Pump Level for EACH of the next "
+            f"{self.forecast_horizon} steps -- a separate, forward-looking input, NOT one of the 12 "
+            "context rows -- with one value per step, not a single action held constant (it can change "
+            "within the window).\n"
+            "Each query below asks you to predict the NEXT patch's token for exactly ONE named "
+            "variable -- never all 12 at once. A few worked examples (that same single variable, "
+            "similar past situations and what actually happened next) are given before the real "
+            "query -- use them to infer what the codes and bins mean in context.\n\n"
+            "Return ONLY that one row: 7 space-separated integers (c0 c1 c2 mu sigma min max), no "
+            "labels, no explanations, no markdown -- nothing else."
         )
 
-    def _format_patch_tokens(self, tokens: dict, include_reward: bool) -> str:
+    def _format_patch_tokens(self, tokens: dict) -> str:
         """tokens: dict from _tokenize_patch (batch dim 1). One compact row per channel, no
         labels -- row order matches FEATURE_NAMES, as declared once in the system prompt.
-        The three reward fields (Eq 24-25) are per-patch, not per-channel -- unlike shape/
-        mu/sigma/min/max, the same three values are appended to every row, not read per i."""
-        lines = []
-        if include_reward:
-            r_map = int(tokens["q_r_map"][0])
-            r_hr = int(tokens["q_r_hr"][0])
-            r_pulsat = int(tokens["q_r_pulsat"][0])
-        for i in range(self.num_channels - 1):  # exclude Pump Level channel (index 11), it's the action
-            c0, c1, c2 = tokens["q_shape"][0, i].tolist()
-            mu = int(tokens["q_mu"][0, i])
-            sigma = int(tokens["q_sigma"][0, i])
-            mn = int(tokens["q_min"][0, i])
-            mx = int(tokens["q_max"][0, i])
-            vals = [c0, c1, c2, mu, sigma, mn, mx]
-            if include_reward:
-                vals.extend([r_map, r_hr, r_pulsat])
-            lines.append(" ".join(str(v) for v in vals))
-        return "\n".join(lines)
+        Row count is read off the tokens dict itself, not hardcoded (always 12 for the
+        context block now; used only for context, since a prediction is a single row --
+        see _format_single_row). Each row is the same 7 fields as a predicted row; the
+        per-patch reward bins go on their own line instead (see _format_reward_bins)."""
+        n_rows = tokens["q_shape"].shape[1]
+        return "\n".join(self._format_single_row(tokens, i) for i in range(n_rows))
 
-    def _build_user_prompt(self, ctx_tokens: dict, p_level_seq) -> str:
+    def _format_reward_bins(self, tokens: dict) -> str:
+        """The three reward fields (Eq 24-25) are per-patch, not per-channel, so they're
+        stated once for the whole context patch rather than repeated on every row --
+        which also keeps context rows the same 7-field width as the answer row."""
+        return " ".join(str(int(tokens[k][0])) for k in ("q_r_map", "q_r_hr", "q_r_pulsat"))
+
+    def _format_single_row(self, tokens: dict, feature_idx: int = 0) -> str:
+        """tokens: dict from _tokenize_patch holding exactly one channel at position
+        feature_idx (batch dim 1). Used for a few-shot assistant target -- no reward,
+        matching the single-row answer the model itself must produce."""
+        c0, c1, c2 = tokens["q_shape"][0, feature_idx].tolist()
+        mu = int(tokens["q_mu"][0, feature_idx])
+        sigma = int(tokens["q_sigma"][0, feature_idx])
+        mn = int(tokens["q_min"][0, feature_idx])
+        mx = int(tokens["q_max"][0, feature_idx])
+        return " ".join(str(v) for v in [c0, c1, c2, mu, sigma, mn, mx])
+
+    def _build_user_prompt_single(self, ctx_tokens: dict, p_level_seq, feature_idx: int) -> str:
         """p_level_seq: array-like of forecast_horizon ints, one P-level per predicted step
-        (already resolved to this shape by the caller -- see _as_pl_seq)."""
+        (already resolved to this shape by the caller -- see _as_pl_seq). feature_idx:
+        which of the 12 FEATURE_NAMES this call asks the model to predict -- one LLM call
+        per feature, not all 12 in a single response (see module docstring)."""
         action_str = " ".join(f"P{int(p)}" for p in p_level_seq)
+        fname = FEATURE_NAMES[feature_idx]
         return (
-            f"## Context ({self.forecast_horizon} timesteps, tokenized, 11 rows):\n"
-            f"{self._format_patch_tokens(ctx_tokens, include_reward=True)}\n\n"
+            f"## Context ({self.forecast_horizon} timesteps, tokenized, 12 rows, incl. Pump Level history):\n"
+            f"{self._format_patch_tokens(ctx_tokens)}\n"
+            f"## Context reward bins (r_map r_hr r_pulsat): {self._format_reward_bins(ctx_tokens)}\n\n"
             f"## Action: Pump Level for each of the next {self.forecast_horizon} steps = {action_str}\n\n"
-            "## Predict the next patch's token for each variable (11 rows, 7 ints each, see format above):"
+            f"## Predict the next patch's token for {fname} ONLY (1 row, 7 ints, see format above):"
         )
-
-    def _format_example_assistant(self, fc_tokens: dict) -> str:
-        return self._format_patch_tokens(fc_tokens, include_reward=False)
 
     # ── LLM inference ─────────────────────────────────────────────────────────
 
@@ -388,25 +425,33 @@ class GormpoFewShotWorldModel:
         with torch.no_grad():
             output_ids = self.llm.generate(
                 input_ids,
-                max_new_tokens=256,  # 11 rows * 7 ints, compact (no labels/JSON) -- measured ~154 tokens
+                max_new_tokens=32,  # one row, 7 ints, compact (no labels/JSON) -- ~14 tokens typical
                 temperature=self.temperature,
                 do_sample=True,
                 num_return_sequences=n,
                 pad_token_id=self.llm_tokenizer.eos_token_id,
+                # no_repeat_ngram_size=10 was tried here (and in _run_llm_batch) as a guard
+                # against repetition-loop degeneration when one generation had to produce
+                # all 12 rows in sequence -- it regressed Qwen's fallback rate (60% vs 5%)
+                # because it also forbids short substrings two genuinely different rows
+                # share by chance. Now that each call produces exactly one row, there is
+                # nothing earlier in the SAME generation to loop back to, so the failure
+                # mode this was guarding against can't occur here -- dropped rather than
+                # carried forward.
             )
         prompt_len = input_ids.shape[1]
         return [self.llm_tokenizer.decode(ids[prompt_len:], skip_special_tokens=True) for ids in output_ids]
 
-    def _parse_response(self, text: str) -> dict:
-        """Parses the compact row format ("c0 c1 c2 mu sigma min max" per line, no
-        labels, one row per variable in FEATURE_NAMES order). Returns a tokens dict
-        (batch dim 1, like _tokenize_patch's output) or None on failure."""
+    def _parse_single_response(self, text: str) -> dict:
+        """Parses exactly one row ("c0 c1 c2 mu sigma min max", no label) -- the single
+        feature this call asked for. Returns a tokens dict (batch dim 1, 1 channel) or
+        None on failure. Takes the first well-formed, in-range line, skipping any
+        preamble the model adds despite the "nothing else" instruction."""
         text = re.sub(r"```(?:\w+)?|```", "", text).strip()
 
         def _in_range(v, lo, hi):
             return lo <= v <= hi
 
-        rows = []
         for line in text.splitlines():
             # Observed failure mode: chat-tuned models default to markdown list/heading
             # habits ("## 232 132 ...", "- 232 132 ...") despite the "no markdown"
@@ -414,30 +459,19 @@ class GormpoFewShotWorldModel:
             # Strip only leading list/heading punctuation, not interior characters.
             line = re.sub(r"^[\s#\-*>]+", "", line.strip())
             parts = line.split()
-            # Observed failure mode (both stock and LoRA-merged Llama3-Med42-8B):
-            # the model echoes trailing values from the *context* block's format on
-            # otherwise-correct predicted rows, even though the TASK section explicitly
-            # asks for 7 (no reward) on the predicted row. Context rows now carry 10
-            # fields (7 + 3 reward, Eq 24-25), so up to 3 spurious trailing echoes are
-            # possible, not just 1 -- accept 7-10 and keep only the first 7 rather than
-            # rejecting an otherwise well-formed, in-range row outright.
+            # Observed failure mode (both stock and LoRA-merged Llama3-Med42-8B): the
+            # model echoes trailing values from the *context* block's format on an
+            # otherwise-correct predicted row. That was observed when context rows carried
+            # 10 fields (7 + 3 reward, Eq 24-25); rewards now sit on their own line, but
+            # up to 3 spurious trailing values are still tolerated -- accept 7-10 and keep
+            # only the first 7 rather than rejecting a well-formed, in-range row outright.
             if len(parts) not in (7, 8, 9, 10):
-                continue  # skip blank/stray lines (e.g. accidental labels, markdown)
+                continue  # skip blank/stray lines (e.g. accidental preamble, markdown)
             parts = parts[:7]
             try:
-                rows.append([int(p) for p in parts])
+                row = [int(p) for p in parts]
             except ValueError:
                 continue  # a non-integer token on this line -- not a valid row
-            if len(rows) == self.num_channels - 1:
-                break
-
-        if len(rows) != self.num_channels - 1:
-            return None
-
-        q_shape = np.zeros((1, self.num_channels - 1, self.L), dtype=np.int64)
-        q_mu = np.zeros((1, self.num_channels - 1), dtype=np.int64)
-        q_sigma = np.zeros((1, self.num_channels - 1), dtype=np.int64)
-        for i, row in enumerate(rows):
             shape, mu, sigma = row[:3], row[3], row[4]
             # The LLM is free-generating integers; anything out of the tokenizer's actual
             # valid range (codebook size / bin count) must be rejected here, not passed
@@ -445,13 +479,17 @@ class GormpoFewShotWorldModel:
             # device-side assert deep inside the tokenizer's dequantize, not a catchable
             # Python exception.
             if not all(_in_range(c, 0, self.num_embeddings - 1) for c in shape):
-                return None
+                continue
             if not (_in_range(mu, 0, self.num_bins - 1) and _in_range(sigma, 0, self.num_bins - 1)):
-                return None
-            q_shape[0, i] = shape
-            q_mu[0, i] = mu
-            q_sigma[0, i] = sigma
-        return {"q_shape": q_shape, "q_mu": q_mu, "q_sigma": q_sigma}
+                continue
+            q_shape = np.zeros((1, 1, self.L), dtype=np.int64)
+            q_mu = np.zeros((1, 1), dtype=np.int64)
+            q_sigma = np.zeros((1, 1), dtype=np.int64)
+            q_shape[0, 0] = shape
+            q_mu[0, 0] = mu
+            q_sigma[0, 0] = sigma
+            return {"q_shape": q_shape, "q_mu": q_mu, "q_sigma": q_sigma}
+        return None
 
     def _as_pl_seq(self, p_level) -> np.ndarray:
         """Normalizes either a plain P-level int (held constant across the horizon, for RL
@@ -466,73 +504,70 @@ class GormpoFewShotWorldModel:
         )
         return arr.astype(np.int64)
 
-    def _fallback(self, context_norm: torch.Tensor, p_level_seq) -> np.ndarray:
-        """Last-observation carry-forward in physical units, (forecast_horizon, 12) --
-        the 11 physiological channels repeat the last observed context row, but the Pump
-        Level column now follows the real per-step action sequence, not one repeated value."""
-        last = self._unnorm_context(context_norm)[-1].copy()
-        out = np.tile(last, (self.forecast_horizon, 1)).astype(np.float32)
-        out[:, -1] = np.asarray(p_level_seq, dtype=np.float32)
-        return out
-
     # ── public API ────────────────────────────────────────────────────────────
+    #
+    # One LLM call per feature: each of the 12 channels is predicted by its own
+    # query/generate() call (asking for exactly one row), not all 12 together in one
+    # response. This is what eliminates the repetition-loop degeneration failure mode
+    # (see _run_llm's comment) rather than just mitigating it -- there's nothing earlier
+    # in the same short generation to loop back to. A per-feature failure (all n samples
+    # for THAT feature unparseable) falls back to last-observation-carry-forward for just
+    # that one channel, not the whole episode, since the 12 queries are now independent.
 
     def _generate_samples(self, context_norm: torch.Tensor, p_level, n: int) -> np.ndarray:
-        """Returns (n_valid, forecast_horizon, 12) physical-unit samples (n_valid <= n;
-        falls back to a single last-observation-carry-forward sample if none parse)."""
+        """Returns (n_valid, forecast_horizon, 12) physical-unit samples; n_valid is the
+        smallest per-feature valid-sample count across the 12 independent queries."""
         p_level_seq = self._as_pl_seq(p_level)
         ctx_physical = self._unnorm_context(context_norm)  # (T, 12)
-        ctx_tokens = self._tokenize_patch(ctx_physical[:, :-1])  # exclude Pump Level column
+        ctx_tokens = self._tokenize_patch(ctx_physical)  # all 12 channels, incl. Pump Level history (state)
+        last_obs = ctx_physical[-1]  # (12,) -- per-feature fallback value
 
-        few_shot_msgs = None
+        few_shot_examples = None
         if self.k_shot > 0 and self._train_last_norm is not None:
             query_last_norm = context_norm[-1].cpu().numpy()
             examples = self._retrieve_examples(query_last_norm, self.k_shot)
-            few_shot_msgs = []
-            for ctx_ex, pl_ex, fc_ex in examples:
-                ex_ctx_tokens = self._tokenize_patch(ctx_ex[:, :-1])
-                ex_fc_tokens = self._tokenize_patch(fc_ex[:, :-1])
-                few_shot_msgs.append((
-                    self._build_user_prompt(ex_ctx_tokens, pl_ex),
-                    self._format_example_assistant(ex_fc_tokens),
-                ))
+            few_shot_examples = [
+                (self._tokenize_patch(ctx_ex), pl_ex, self._tokenize_patch(fc_ex))
+                for ctx_ex, pl_ex, fc_ex in examples
+            ]
 
-        user_prompt = self._build_user_prompt(ctx_tokens, p_level_seq)
-        raws = self._run_llm(user_prompt, few_shot_messages=few_shot_msgs, n=n)
+        per_feature_samples = []
+        episode_had_fallback = False
+        for j in range(self.num_channels):
+            few_shot_msgs = None
+            if few_shot_examples is not None:
+                few_shot_msgs = [
+                    (self._build_user_prompt_single(ex_ctx_tok, pl_ex, j), self._format_single_row(ex_fc_tok, j))
+                    for ex_ctx_tok, pl_ex, ex_fc_tok in few_shot_examples
+                ]
+            user_prompt = self._build_user_prompt_single(ctx_tokens, p_level_seq, j)
+            raws = self._run_llm(user_prompt, few_shot_messages=few_shot_msgs, n=n)
 
-        samples = []
-        for raw in raws:
-            pred_tokens = self._parse_response(raw)
-            if pred_tokens is None:
-                continue
-            try:
-                pred_phys = self._detokenize_channels(
-                    pred_tokens["q_shape"][0], pred_tokens["q_mu"][0], pred_tokens["q_sigma"][0]
-                )  # (forecast_horizon, N-1)
-            except Exception as e:
-                # _parse_response already range-checks every index against the tokenizer's
-                # actual codebook/bin sizes (the one class of error that corrupts the CUDA
-                # context if it reaches a kernel uncaught); this is a last-resort net for
-                # anything else unexpected, so one bad sample can't take down the whole run.
-                print(f"[GormpoFewShot] Unexpected decode failure, skipping sample: {e}")
-                continue
-            if self._phys_low is not None:
-                # Safety net: the LLM occasionally predicts a shape-code/scale-bin
-                # combination that decodes to something physically impossible (observed:
-                # SYSTOLIC crashing to ~-450 mmHg), since nothing in the tokenizer's
-                # decoder inherently bounds its output range. This doesn't fix why that
-                # happens, it just stops it from propagating into the reported
-                # prediction -- clipped to the same training-data percentile bounds
-                # (compute_variable_ylims) used for this model's plotting axes too.
-                pred_phys = np.clip(pred_phys, self._phys_low, self._phys_high)
-            pl_col = p_level_seq.astype(np.float32).reshape(self.forecast_horizon, 1)
-            samples.append(np.concatenate([pred_phys, pl_col], axis=1))  # (forecast_horizon, 12)
+            vals = []
+            for raw in raws:
+                pred_tokens = self._parse_single_response(raw)
+                if pred_tokens is None:
+                    continue
+                try:
+                    phys = self._detokenize_channels(
+                        pred_tokens["q_shape"][0], pred_tokens["q_mu"][0], pred_tokens["q_sigma"][0], channels=[j]
+                    )  # (forecast_horizon, 1)
+                except Exception as e:
+                    print(f"[GormpoFewShot] Unexpected decode failure ({FEATURE_NAMES[j]}), skipping sample: {e}")
+                    continue
+                vals.append(phys[:, 0])
 
-        if not samples:
-            print(f"[GormpoFewShot] All {n} responses unparseable; using fallback.")
-            samples = [self._fallback(context_norm, p_level_seq)]
+            if not vals:
+                print(f"[GormpoFewShot] Feature {FEATURE_NAMES[j]}: all {n} responses unparseable; using fallback.")
+                episode_had_fallback = True
+                vals = [np.full(self.forecast_horizon, last_obs[j], dtype=np.float32)]
+            per_feature_samples.append(np.stack(vals))  # (n_valid_j, forecast_horizon)
 
-        return np.stack(samples)
+        if episode_had_fallback:
+            print(f"[GormpoFewShot] All {n} responses unparseable for >=1 feature this episode; used per-feature fallback.")
+
+        n_valid = min(v.shape[0] for v in per_feature_samples)
+        return np.stack([v[:n_valid] for v in per_feature_samples], axis=-1)  # (n_valid, forecast_horizon, 12)
 
     def predict(self, context_norm: torch.Tensor, p_level):
         """
@@ -551,14 +586,13 @@ class GormpoFewShotWorldModel:
         std_norm = torch.tensor(std_phys / s, dtype=torch.float32)
         return mean_norm, std_norm
 
-    # ── batched LLM call: multiple DIFFERENT episodes in one generate() call ──
+    # ── batched LLM call: multiple DIFFERENT episodes (and features) in one generate() call ──
     #
-    # _generate_samples()/predict() above only batch the num_samples dimension for a
-    # SINGLE episode. Full-test-set eval at that rate is ~13-14.5h for zero-shot/
-    # few-shot (measured on a 100-example pilot). These methods are purely additive --
-    # _generate_samples()/predict() are untouched -- and pack B different episodes'
-    # prompts into one left-padded batch, each still sampled num_samples times via
-    # num_return_sequences, so total generate() batch size is B * num_samples. Same
+    # _generate_samples()/predict() above loop over the 12 features with a separate
+    # _run_llm() call each, for a SINGLE episode. These methods pack B episodes * 12
+    # features into one left-padded batch, each still sampled num_samples times via
+    # num_return_sequences, so total generate() batch size is B * 12 * num_samples --
+    # one call covers every feature for every episode in the chunk. Same left-padding
     # pattern as world_model.py's FewShotDigitTokenWorldModel.predict_batch().
 
     def _run_llm_batch(self, query_msgs: list, few_shot_messages_list: list, n: int = 1) -> list:
@@ -590,11 +624,13 @@ class GormpoFewShotWorldModel:
             out = self.llm.generate(
                 input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=256,  # 11 rows * 7 ints, compact (no labels/JSON) -- measured ~154 tokens
+                max_new_tokens=32,  # one row, 7 ints, compact (no labels/JSON) -- ~14 tokens typical
                 temperature=self.temperature,
                 do_sample=True,
                 num_return_sequences=n,
                 pad_token_id=self.llm_tokenizer.pad_token_id or self.llm_tokenizer.eos_token_id,
+                # no_repeat_ngram_size dropped -- see _run_llm's comment, doesn't apply
+                # to single-row generation.
             )
         # every row shares the same (left-padded) prompt length, so a single
         # prompt_len slice is valid for all B*n output rows.
@@ -608,58 +644,74 @@ class GormpoFewShotWorldModel:
         return [decoded[b * n : (b + 1) * n] for b in range(B)]
 
     def _generate_samples_batch(self, contexts_norm: list, p_levels: list, n: int) -> list:
-        """Batched _generate_samples(): contexts_norm/p_levels are same-length lists
-        (one entry per episode; each p_level is an int or a (forecast_horizon,) array-like,
-        see _as_pl_seq). Returns a list of (n_valid, forecast_horizon, 12) physical-unit
-        arrays, one per episode, same order as inputs."""
+        """Batched _generate_samples(): one generate() call covers every (episode,
+        feature) pair -- B episodes * 12 features flattened into a single batch
+        dimension (feature varying fastest within an episode), each still sampled n
+        times via num_return_sequences, so total generate() batch size is B * 12 * n.
+        Returns a list of (n_valid, forecast_horizon, 12) physical-unit arrays, one per
+        episode, same order as inputs."""
         p_level_seqs = [self._as_pl_seq(pl) for pl in p_levels]
-        ctx_physicals = [self._unnorm_context(c) for c in contexts_norm]
-        ctx_tokens_list = [self._tokenize_patch(cp[:, :-1]) for cp in ctx_physicals]
-        query_msgs = [self._build_user_prompt(ct, pl) for ct, pl in zip(ctx_tokens_list, p_level_seqs)]
+        ctx_physicals = [self._unnorm_context(c) for c in contexts_norm]  # each (T, 12)
+        ctx_tokens_list = [self._tokenize_patch(cp) for cp in ctx_physicals]  # all 12 channels, incl. Pump Level history
 
-        few_shot_msgs_list = []
+        few_shot_examples_per_episode = []
         for context_norm in contexts_norm:
             if self.k_shot > 0 and self._train_last_norm is not None:
                 query_last_norm = context_norm[-1].cpu().numpy()
                 examples = self._retrieve_examples(query_last_norm, self.k_shot)
-                few_shot_msgs = []
-                for ctx_ex, pl_ex, fc_ex in examples:
-                    ex_ctx_tokens = self._tokenize_patch(ctx_ex[:, :-1])
-                    ex_fc_tokens = self._tokenize_patch(fc_ex[:, :-1])
-                    few_shot_msgs.append((
-                        self._build_user_prompt(ex_ctx_tokens, pl_ex),
-                        self._format_example_assistant(ex_fc_tokens),
-                    ))
-                few_shot_msgs_list.append(few_shot_msgs)
+                few_shot_examples_per_episode.append([
+                    (self._tokenize_patch(ctx_ex), pl_ex, self._tokenize_patch(fc_ex))
+                    for ctx_ex, pl_ex, fc_ex in examples
+                ])
             else:
-                few_shot_msgs_list.append(None)
+                few_shot_examples_per_episode.append(None)
 
-        raws_per_episode = self._run_llm_batch(query_msgs, few_shot_msgs_list, n=n)
+        query_msgs, few_shot_msgs_list = [], []
+        for ct, pl_seq, examples in zip(ctx_tokens_list, p_level_seqs, few_shot_examples_per_episode):
+            for j in range(self.num_channels):
+                query_msgs.append(self._build_user_prompt_single(ct, pl_seq, j))
+                if examples is not None:
+                    few_shot_msgs_list.append([
+                        (self._build_user_prompt_single(ex_ctx_tok, pl_ex, j), self._format_single_row(ex_fc_tok, j))
+                        for ex_ctx_tok, pl_ex, ex_fc_tok in examples
+                    ])
+                else:
+                    few_shot_msgs_list.append(None)
+
+        raws_flat = self._run_llm_batch(query_msgs, few_shot_msgs_list, n=n)  # B*12 lists of n raw strings
 
         results = []
-        for context_norm, p_level_seq, raws in zip(contexts_norm, p_level_seqs, raws_per_episode):
-            samples = []
-            for raw in raws:
-                pred_tokens = self._parse_response(raw)
-                if pred_tokens is None:
-                    continue
-                try:
-                    pred_phys = self._detokenize_channels(
-                        pred_tokens["q_shape"][0], pred_tokens["q_mu"][0], pred_tokens["q_sigma"][0]
-                    )
-                except Exception as e:
-                    print(f"[GormpoFewShot] Unexpected decode failure, skipping sample: {e}")
-                    continue
-                if self._phys_low is not None:
-                    pred_phys = np.clip(pred_phys, self._phys_low, self._phys_high)
-                pl_col = p_level_seq.astype(np.float32).reshape(self.forecast_horizon, 1)
-                samples.append(np.concatenate([pred_phys, pl_col], axis=1))
+        for b, (ctx_physical, p_level_seq) in enumerate(zip(ctx_physicals, p_level_seqs)):
+            last_obs = ctx_physical[-1]  # (12,) -- per-feature fallback value
+            per_feature_samples = []
+            episode_had_fallback = False
+            for j in range(self.num_channels):
+                raws = raws_flat[b * self.num_channels + j]
+                vals = []
+                for raw in raws:
+                    pred_tokens = self._parse_single_response(raw)
+                    if pred_tokens is None:
+                        continue
+                    try:
+                        phys = self._detokenize_channels(
+                            pred_tokens["q_shape"][0], pred_tokens["q_mu"][0], pred_tokens["q_sigma"][0], channels=[j]
+                        )  # (forecast_horizon, 1)
+                    except Exception as e:
+                        print(f"[GormpoFewShot] Unexpected decode failure ({FEATURE_NAMES[j]}), skipping sample: {e}")
+                        continue
+                    vals.append(phys[:, 0])
 
-            if not samples:
-                print(f"[GormpoFewShot] All {n} responses unparseable; using fallback.")
-                samples = [self._fallback(context_norm, p_level_seq)]
+                if not vals:
+                    print(f"[GormpoFewShot] Feature {FEATURE_NAMES[j]}: all {n} responses unparseable; using fallback.")
+                    episode_had_fallback = True
+                    vals = [np.full(self.forecast_horizon, last_obs[j], dtype=np.float32)]
+                per_feature_samples.append(np.stack(vals))
 
-            results.append(np.stack(samples))
+            if episode_had_fallback:
+                print(f"[GormpoFewShot] All {n} responses unparseable for >=1 feature this episode; used per-feature fallback.")
+
+            n_valid = min(v.shape[0] for v in per_feature_samples)
+            results.append(np.stack([v[:n_valid] for v in per_feature_samples], axis=-1))
         return results
 
     def predict_batch(self, contexts_norm: list, p_levels: list):

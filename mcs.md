@@ -2,8 +2,8 @@
 
 ## Project overview
 Model-based offline RL (GORMPO/CORMPO) for Impella pump-level weaning decisions.
-Replacing the Transformer-based digital twin in `abiomed_env/model.py` with an LLM world model
-that uses in-context learning for multivariate clinical time series forecasting.
+Replacing a Transformer-based digital twin with an LLM world model that uses in-context learning
+for multivariate clinical time series forecasting.
 
 ## Codebase structure
 ```
@@ -49,12 +49,18 @@ Output must cover all 12 state variables. Uncertainty via token log-probabilitie
 
 ## Tokenization (GORMPO)
 Each variable's 6-timestep patch history is summarized as a discrete token, not a raw number —
-produced by the GORMPO tokenizer (`forecasting/lib/models/tokenizer.py`, a cross-channel-attention
-VQ-VAE; checkpoint at `forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000`). Each token
-has 10 parts, always in this fixed order, one row per variable:
+produced by the GORMPO tokenizer, a cross-channel-attention VQ-VAE.
+Each variable's token has 7 parts, always in this fixed order, one row per variable:
 
 ```
-c0 c1 c2 mu sigma min max r_map r_hr r_pulsat
+c0 c1 c2 mu sigma min max
+```
+
+The context patch also carries 3 reward bins, given once on their own line after the 12 rows
+(not repeated on every row):
+
+```
+r_map r_hr r_pulsat
 ```
 
 - `c0, c1, c2` — three integers in [0, 255], indices into a learned codebook of 256 morphological
@@ -67,19 +73,20 @@ c0 c1 c2 mu sigma min max r_map r_hr r_pulsat
 - `r_map, r_hr, r_pulsat` — three integers in {1, ..., 8} (Eq 24-25; never 0 -- that value only
   ever meant "not applicable" in the old per-channel encoding, which no longer applies now that
   all three are always computed per patch), one per clinical reward signal
-  (based on PumpPressure/MAP, Heart Rate, and PULSAT respectively). These are the SAME three values
-  on every row regardless of which variable that row describes — they summarize the whole patch's
-  clinical stability, not just the named channel's own row. 8 = no penalty (stable), 1 = maximally
-  unstable (clamped). Context only, never predicted.
+  (based on PumpPressure/MAP, Heart Rate, and PULSAT respectively). They belong to the whole patch,
+  not to any one variable — they summarize the patch's overall clinical stability. 8 = no penalty
+  (stable), 1 = maximally unstable (clamped). Context only, never predicted.
 
-Feature order (row 0-10 in every context/prediction block; Pump Level excluded — it's the action):
-PumpPressure, PumpSpeed, PumpFlow, LVP, LVEDP, SYSTOLIC, DIASTOLIC, PULSAT, PumpCurrent, Heart Rate,
-ESE_lv.
+Feature order (row 0-11, same order in both the context and prediction blocks — the full 12-variable
+state, Pump Level included as row 11): PumpPressure, PumpSpeed, PumpFlow, LVP, LVEDP, SYSTOLIC,
+DIASTOLIC, PULSAT, PumpCurrent, Heart Rate, ESE_lv, Pump Level.
 
-Task: given `forecast_horizon` timesteps of context (tokenized as 11 rows in the format above) plus
-the chosen Pump Level for each of the next `forecast_horizon` steps (a per-step action sequence,
-not one value held constant — see Interface contract above), predict the next patch's token for
-each of the 11 variables as `c0 c1 c2 mu sigma min max` (7 integers, no reward).
+Task: given `forecast_horizon` timesteps of context (tokenized as 12 rows in the format above —
+the full state, including Pump Level's own recent history — plus the reward-bin line) plus the
+action — the chosen Pump Level for each of the next `forecast_horizon` steps (a per-step,
+forward-looking sequence, not one value held constant, and NOT itself one of the 12 context rows) — predict
+the next patch's token for all 12 variables, including Pump Level, as `c0 c1 c2 mu sigma min max`
+(7 integers, no reward).
 
 ## Action space
 P-level ∈ {2, 3, 4, 5, 6, 7, 8, 9, 10}. Higher P = more support, higher RPM/flow, lower LV preload.

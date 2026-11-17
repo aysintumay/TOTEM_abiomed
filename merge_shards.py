@@ -22,6 +22,7 @@ from lib.models.metrics import dtw, pearsoncor  # noqa: E402
 FEATURE_NAMES = [
     "PumpPressure", "PumpSpeed", "PumpFlow", "LVP", "LVEDP", "SYSTOLIC",
     "DIASTOLIC", "PULSAT", "PumpCurrent", "Heart Rate", "ESE_lv",
+    "Pump Level",  # only present in 12-column shards (eval_gormpo_world_model.py)
 ]
 
 
@@ -57,10 +58,10 @@ def main(args):
     ])
 
     print("\n=== Per-variable MAE / MSE / DTW / Pearson corr (normalized/z-score units, averaged over all samples) ===")
-    for j in range(11):
+    for j in range(pred.shape[-1]):
         print(f"  {FEATURE_NAMES[j]:<14} MAE={mae[j]:7.4f}  MSE={mse[j]:7.4f}  DTW={dtw_dist[j]:7.4f}  corr={corr[j]:7.4f}")
     print(
-        f"\nOverall (mean across all 11 variables): "
+        f"\nOverall (mean across all {pred.shape[-1]} variables): "
         f"MAE={mae.mean():.4f}  MSE={mse.mean():.4f}  DTW={dtw_dist.mean():.4f}  corr={corr.mean():.4f}"
     )
     print(f"Fallback rate: {total_fallback}/{pred.shape[0]} examples had all samples unparseable")

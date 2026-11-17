@@ -27,6 +27,7 @@ from lib.models.metrics import dtw, pearsoncor  # noqa: E402
 def main(args):
     model = FewShotDigitTokenWorldModel(
         k_shot=args.k_shot,
+        mcs_context=args.mcs_context,
         model_id=args.model_id,
         num_features=12,
         forecast_horizon=6,
@@ -118,6 +119,8 @@ if __name__ == "__main__":
     parser.add_argument("--random_seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
+    parser.add_argument("--mcs_context", action="store_true",
+                        help="prepend mcs.md's clinical/project sections to the system prompt")
     parser.add_argument("--shard_id", type=int, default=0, help="this process's shard index, 0-based")
     parser.add_argument("--num_shards", type=int, default=1, help="total shards splitting --num_examples across parallel processes")
     parser.add_argument("--output_npz", type=str, default="", help="save raw (pred, true) arrays here for merge_shards.py")

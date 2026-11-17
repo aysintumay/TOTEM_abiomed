@@ -43,6 +43,8 @@ class GormpoTokenLLMForecaster(BaseModel):
         num_embeddings=256,
         num_bins=32,
         num_reward_bins=9,
+        num_pump_levels=9,  # Impella P-level 2-10 inclusive
+        action_len=6,  # number of raw future timesteps the given action covers
         lora_r=8,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -130,6 +132,32 @@ class GormpoTokenLLMForecaster(BaseModel):
         self.reward_hr_embedding = _emb(num_reward_bins)
         self.reward_pulsat_embedding = _emb(num_reward_bins)
 
+        # The chosen future Pump Level (the *action*) is given, not forecasted -- see
+        # train_gormpo_llm_forecaster.py's PL_CHANNEL split. Matches the ICL world model
+        # (gormpo_world_model.py), whose prompt states the next-window P-level as a known
+        # input rather than asking the LLM to predict it: without this, the model has no
+        # way to answer "what happens if P-level is set to X", since it would just predict
+        # its own guess of P-level jointly with everything else instead of conditioning on
+        # a specified one -- not usable as an MBRL world model.
+        # Must be ORDER-AWARE across the action_len future timesteps (P-level can ramp
+        # within a window). Two prior attempts here didn't achieve that properly: summing
+        # a per-timestep embedding across positions is commutative (can't tell a ramp from
+        # its reverse); a single nn.Linear reading the ordered vector IS technically order-
+        # aware (different weight columns per position) but only as a flat, position-
+        # independent bias added uniformly onto the context positions -- the backbone's own
+        # attention never gets to relate "action at t" to anything, since the information
+        # never occupies its own sequence position. Decision-Transformer-style instead: each
+        # of the action_len timesteps gets its own embedding AND its own distinct sequence
+        # position (see embed(), which prepends these before the shape-code positions), so
+        # the backbone's own rotary positional encoding -- not a hand-built mechanism -- is
+        # what lets attention distinguish "action at t=0" from "action at t=5", the same way
+        # it would for any other sequence. mu/sigma/min/max/reward stay as an additive bias
+        # on the context positions unchanged -- those are genuine per-patch aggregate stats
+        # with no timestep structure to preserve, unlike the action.
+        self.action_len = action_len
+        self.num_pump_levels = num_pump_levels
+        self.action_embedding = _emb(num_pump_levels)
+
         # Target-patch scalar heads (Eq 28's "predicted scale statistics"), read off the
         # hidden state at the context/target boundary.
         self.mu_head = _head(num_bins)
@@ -138,13 +166,23 @@ class GormpoTokenLLMForecaster(BaseModel):
         self.max_head = _head(num_bins)
 
     def embed(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None,
-              x_r_map=None, x_r_hr=None, x_r_pulsat=None, TCin=None):
+              x_r_map=None, x_r_hr=None, x_r_pulsat=None, y_action=None, TCin=None):
         """input_ids: (N, L) shape codes. x_mu/x_sigma/x_min/x_max/x_r_map/x_r_hr/
         x_r_pulsat: (N,) context-patch scalar bin indices, broadcast-added to the first
         TCin positions only (the context/x-half); absent entirely from target/y-half
         positions. The three reward fields are per-patch, not per-channel (see
         tokenizer.py's RewardQuantizer) -- callers broadcast them to (N,) across
-        channels before flattening, same as train_gormpo_llm_forecaster.py does."""
+        channels before flattening, same as train_gormpo_llm_forecaster.py does.
+        y_action: (N, action_len) LongTensor, zero-indexed Pump Level (level - 2) for
+        EACH of the target patch's raw future timesteps, ORDER PRESERVED -- the *given*
+        future action, not a forecast target. Each timestep gets its OWN embedding
+        lookup AND its own sequence position (prepended before the shape-code
+        positions, not summed into a bias) -- so the backbone's own rotary positional
+        encoding, not a hand-built mechanism, is what makes t=0's action distinguishable
+        from t=5's to the attention layers. See action_embedding's docstring/comment
+        in __init__ for why this replaced two earlier (less order-faithful) attempts.
+        Returns: (N, action_len + L, H) if y_action given, else (N, L, H).
+        """
         code_embeds = self.code_embedding(input_ids)  # (N, L, H)
         if TCin is not None and x_mu is not None:
             scalar_sum = (
@@ -156,17 +194,26 @@ class GormpoTokenLLMForecaster(BaseModel):
             pad = torch.zeros_like(code_embeds)
             pad[:, :TCin, :] = scalar_sum.unsqueeze(1)
             code_embeds = code_embeds + pad
+        if y_action is not None:
+            action_embeds = self.action_embedding(y_action)  # (N, action_len, H)
+            code_embeds = torch.cat([action_embeds, code_embeds], dim=1)  # (N, action_len + L, H)
         return code_embeds
 
     def forward(self, input_ids, x_mu=None, x_sigma=None, x_min=None, x_max=None,
-                x_r_map=None, x_r_hr=None, x_r_pulsat=None, TCin=None):
+                x_r_map=None, x_r_hr=None, x_r_pulsat=None, y_action=None, TCin=None):
         """
         Returns:
-            shape_logits: (N, L, num_embeddings)
-            hidden_states: (N, L, hidden_size) -- index [:, TCin - 1, :] is the
-                context/target boundary representation used by predict_scalars().
+            shape_logits: (N, action_len + L, num_embeddings) if y_action given (else
+                (N, L, num_embeddings)) -- the first action_len positions are the given
+                action, never a prediction target; callers must slice them off
+                (shape_logits[:, model.action_len:, :]) before computing shape loss.
+            hidden_states: same leading shape. Index
+                [:, action_len + TCin - 1, :] (or [:, TCin - 1, :] if no y_action) is
+                the context/target boundary representation used by predict_scalars().
         """
-        inputs_embeds = self.embed(input_ids, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, TCin)
+        inputs_embeds = self.embed(
+            input_ids, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, y_action, TCin
+        )
         out = self.backbone(inputs_embeds=inputs_embeds, use_cache=False)
         shape_logits = self.shape_head(out.last_hidden_state)
         return shape_logits, out.last_hidden_state
@@ -182,13 +229,22 @@ class GormpoTokenLLMForecaster(BaseModel):
         }
 
     @torch.no_grad()
-    def generate_codes(self, x_ids, TCout, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat):
+    def generate_codes(self, x_ids, TCout, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, y_action):
         """
         Args:
             x_ids: (N, TCin) context shape codes
             TCout: number of future shape codes to generate
             x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat: (N,) context-patch
                 scalar bin indices
+            y_action: (N, action_len) LongTensor, zero-indexed Pump Level (level - 2) for
+                each raw future timestep, ORDER PRESERVED -- see embed()'s docstring for
+                how this is placed in the sequence. At eval time this is the real action
+                from the held-out episode (same counterfactual-eval protocol
+                eval_gormpo_world_model.py's ICL path uses: "what actually happened
+                given the action that was actually taken"), not something the model
+                must guess. `generated` (below) only ever accumulates shape codes --
+                embed() re-prepends the action_len action positions fresh on every call,
+                so they don't accumulate across the generation loop.
         Returns:
             y_ids: (N, TCout) generated shape codes
             scalars: dict of (N, num_bins) logits, predicted once from the context
@@ -199,10 +255,10 @@ class GormpoTokenLLMForecaster(BaseModel):
         boundary_hidden = None
         for step in range(TCout):
             shape_logits, hidden = self.forward(
-                generated, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, TCin=TCin
+                generated, x_mu, x_sigma, x_min, x_max, x_r_map, x_r_hr, x_r_pulsat, y_action, TCin=TCin
             )
             if step == 0:
-                boundary_hidden = hidden[:, TCin - 1, :]
+                boundary_hidden = hidden[:, self.action_len + TCin - 1, :]
             next_id = torch.argmax(shape_logits[:, -1, :], dim=-1, keepdim=True)
             generated = torch.cat([generated, next_id], dim=1)
         scalars = self.predict_scalars(boundary_hidden)

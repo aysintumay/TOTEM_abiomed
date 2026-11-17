@@ -31,12 +31,18 @@ def make_tiny_hf_model():
 
 
 def run(hf_model, num_embeddings, num_bins):
-    B, N = 4, 12
+    B, N = 4, 11  # 11 physiological channels -- Pump Level is split out as the given
+    # future action (see train_gormpo_llm_forecaster.py's split_action_channel), not
+    # one of the forecasted channels.
+    num_pump_levels = 9  # Impella P-level 2-10 inclusive, zero-indexed range for the fake data below
     compression_factor = 2
     patch_len = 6
     TCin = TCout = patch_len // compression_factor
 
-    model = GormpoTokenLLMForecaster(num_embeddings=num_embeddings, num_bins=num_bins, hf_model=hf_model)
+    model = GormpoTokenLLMForecaster(
+        num_embeddings=num_embeddings, num_bins=num_bins, num_pump_levels=num_pump_levels,
+        action_len=patch_len, hf_model=hf_model,
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -59,6 +65,12 @@ def run(hf_model, num_embeddings, num_bins):
     y_sigma = torch.randint(0, num_bins, (B, N))
     y_min = torch.randint(0, num_bins, (B, N))
     y_max = torch.randint(0, num_bins, (B, N))
+    # Given future action (zero-indexed Pump Level), one value per raw future timestep
+    # (patch_len, not collapsed to a single mean level -- P-level can ramp within a
+    # window), broadcast to (B, N, patch_len) same as the reward fields' per-channel
+    # broadcast.
+    y_action = torch.randint(0, num_pump_levels, (B, patch_len))
+    y_action_bc = y_action.unsqueeze(1).expand(-1, N, -1).contiguous()
 
     x_ids = flatten_channels(codeids_x)  # (B*N, TCin)
     y_ids = flatten_channels(codeids_y)  # (B*N, TCout)
@@ -68,21 +80,25 @@ def run(hf_model, num_embeddings, num_bins):
     y_mu_f, y_sigma_f, y_min_f, y_max_f = (
         flatten_channels_scalar(t) for t in (y_mu, y_sigma, y_min, y_max)
     )
+    y_action_f = y_action_bc.reshape(B * N, patch_len)  # (B*N, patch_len), not flatten_channels_scalar (that's for scalar-per-row, not per-row-per-timestep)
     assert unflatten_channels_scalar(x_mu_f, B, N).equal(x_mu)
 
     inputs, labels = build_training_sequence(x_ids, y_ids)
     assert inputs.shape == (B * N, TCin + TCout - 1)
 
     shape_logits, hidden = model(
-        inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, TCin=TCin
+        inputs, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, y_action_f, TCin=TCin
     )
-    assert shape_logits.shape == (B * N, TCin + TCout - 1, num_embeddings)
-    assert hidden.shape == (B * N, TCin + TCout - 1, model.hidden_size)
+    # action_len leading positions (the given action, its own sequence positions now,
+    # not summed into a bias) precede the TCin+TCout-1 shape-code positions.
+    assert shape_logits.shape == (B * N, patch_len + TCin + TCout - 1, num_embeddings)
+    assert hidden.shape == (B * N, patch_len + TCin + TCout - 1, model.hidden_size)
+    shape_logits = shape_logits[:, model.action_len:, :]  # drop action positions before loss
 
     loss_shape = F.cross_entropy(
         shape_logits.reshape(-1, num_embeddings), labels.reshape(-1), ignore_index=-100
     )
-    boundary_hidden = hidden[:, TCin - 1, :]
+    boundary_hidden = hidden[:, model.action_len + TCin - 1, :]
     scalars_pred = model.predict_scalars(boundary_hidden)
     for name, target in [("mu", y_mu_f), ("sigma", y_sigma_f), ("min", y_min_f), ("max", y_max_f)]:
         assert scalars_pred[name].shape == (B * N, num_bins)
@@ -104,15 +120,17 @@ def run(hf_model, num_embeddings, num_bins):
     )
     scalar_head_grad = sum(p.grad.abs().sum().item() for p in model.mu_head.parameters() if p.grad is not None)
     scalar_embed_grad = sum(p.grad.abs().sum().item() for p in model.mu_embedding.parameters() if p.grad is not None)
+    action_embed_grad = sum(p.grad.abs().sum().item() for p in model.action_embedding.parameters() if p.grad is not None)
     assert lora_grad_norm > 0, "LoRA params should receive gradient"
     assert not base_grad_present, "frozen base backbone params should receive no gradient"
     assert scalar_head_grad > 0, "scalar prediction heads should receive gradient"
     assert scalar_embed_grad > 0, "scalar embeddings should receive gradient from the shape-code loss path"
+    assert action_embed_grad > 0, "action embedding should receive gradient from the shape-code loss path"
     print("gradient check OK: LoRA + all new embeddings/heads trainable, base backbone frozen")
 
     # ----- autoregressive generation + scalar prediction ----- #
     y_ids_pred, gen_scalars = model.generate_codes(
-        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f
+        x_ids, TCout, x_mu_f, x_sigma_f, x_min_f, x_max_f, x_r_map_f, x_r_hr_f, x_r_pulsat_f, y_action_f
     )
     assert y_ids_pred.shape == (B * N, TCout)
     assert (y_ids_pred >= 0).all() and (y_ids_pred < num_embeddings).all()

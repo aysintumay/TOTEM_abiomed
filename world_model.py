@@ -94,7 +94,7 @@ class LLMWorldModel:
         print(f"Loading tokenizer: {model_id}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        model_kwargs = {"dtype": torch.bfloat16, "device_map": device}
+        model_kwargs = {"torch_dtype": torch.bfloat16, "device_map": device}
         if load_in_4bit:
             from transformers import BitsAndBytesConfig
             model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -619,13 +619,48 @@ class FewShotDigitTokenWorldModel(DigitTokenWorldModel):
     all values encoded as digit tokens in normalized space.
     """
 
-    def __init__(self, k_shot: int = 5, **kwargs):
+    def __init__(self, k_shot: int = 5, mcs_context: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.k_shot = k_shot
+        self.mcs_context = mcs_context
         self._train_last_norm = None   # (N, 12) last context state, normalized
         self._train_ctx_norm  = None   # (N, T, 12) full context, normalized
         self._train_fc_norm   = None   # (N, T, 12) forecast incl. PL, normalized
         self._train_pl_int    = None   # (N,) P-level int
+
+    # ── optional mcs.md context ───────────────────────────────────────────────
+    #
+    # With mcs_context=True, mcs.md's clinical/project sections are prepended to the
+    # digit-token system prompt. Developer-facing sections and the GORMPO tokenization
+    # section are dropped -- the latter describes a different token format
+    # (c0 c1 c2 mu sigma ...) that would directly contradict the digit encoding here.
+
+    _MCS_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcs.md")
+    _MCS_MD_EXCLUDED_SECTIONS = {"Codebase structure", "Interface contract", "Tokenization (GORMPO)"}
+    _mcs_md_cache = None
+
+    @classmethod
+    def _load_mcs_md(cls) -> str:
+        if cls._mcs_md_cache is None:
+            with open(cls._MCS_MD_PATH, "r") as f:
+                text = f.read()
+            # split on "## " headings; chunk 0 is the "# " title preamble
+            chunks = re.split(r"(?m)^(?=## )", text)
+            cls._mcs_md_cache = "".join(
+                c for c in chunks
+                if not (c.startswith("## ") and c[3:].splitlines()[0].strip() in cls._MCS_MD_EXCLUDED_SECTIONS)
+            ).strip()
+        return cls._mcs_md_cache
+
+    def _build_system_prompt(self) -> str:
+        base = super()._build_system_prompt()
+        if not self.mcs_context:
+            return base
+        return (
+            "=== PROJECT AND CLINICAL CONTEXT ===\n"
+            f"{self._load_mcs_md()}\n\n"
+            f"{base}"
+        )
 
     # ── data loading ──────────────────────────────────────────────────────────
 

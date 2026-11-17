@@ -40,7 +40,7 @@ DATA_PATH = "/public/gormpo/10min_1hr_all_data.pkl"
 TOKEN_DATA_ROOT = "forecasting/data/gormpo_tokens_mcs_scratch_long2000"
 TOKENIZER_PATH = "forecasting/saved_models/gormpo_tokenizer_mcs_scratch_long2000/checkpoints/final_tokenizer.pth"
 LLM_CHECKPOINT = "forecasting/saved_models/gormpo_llm_qwen7b/checkpoints/gormpo_llm_forecaster_checkpoint.pth"
-DEVICE = "cuda:6"
+DEVICE = "cuda:0"
 SAMPLE_IDXS = [0, 1, 2, 3]  # same test samples as every other visualize_predictions* script
 OUT_DIR = "figures"
 
@@ -67,20 +67,25 @@ test_tensors = dataloaders["test"].dataset.tensors  # 13-tuple, same order train
 batch = tuple(t[SAMPLE_IDXS] for t in test_tensors)
 
 with torch.no_grad():
-    pred_time, labels_time = inference(batch, model, tokenizer, device)  # (4, patch_len, 12) physical each
+    pred_time, labels_time = inference(batch, model, tokenizer, device)  # (4, patch_len, 11) physical each --
+    # Pump Level excluded: it's the given action now (see train_gormpo_llm_forecaster.py's
+    # split_action_channel), not forecasted, so inference() has nothing of its own to
+    # return for that channel.
 
 pred_time = pred_time.cpu().numpy()
 labels_time = labels_time.cpu().numpy()
 ctx_phys_all = test_tensors[0][SAMPLE_IDXS].numpy()  # x_original, (4, patch_len, 12) physical, time-major
+y_orig_all = test_tensors[1][SAMPLE_IDXS].numpy()     # y_original, (4, patch_len, 12) -- still has Pump Level
 
 t_ctx = np.arange(-5, 1) * 10    # -50, -40, ..., 0
 t_pred = np.arange(1, 7) * 10    # +10, +20, ..., +60
 
 for row, idx in enumerate(SAMPLE_IDXS):
-    ctx_phys = ctx_phys_all[row].T   # (12, patch_len)
-    y_true = labels_time[row].T      # (12, patch_len)
-    pred_phys = pred_time[row].T     # (12, patch_len)
-    pl_int = int(round(float(y_true[11].mean())))
+    ctx_phys = ctx_phys_all[row].T    # (12, patch_len)
+    y_orig_full = y_orig_all[row].T   # (12, patch_len) -- includes Pump Level, unlike y_true/pred_phys below
+    y_true = labels_time[row].T       # (11, patch_len)
+    pred_phys = pred_time[row].T      # (11, patch_len)
+    pl_int = int(round(float(y_orig_full[11].mean())))
 
     n_features = 12
     ncols = 4
@@ -107,18 +112,16 @@ for row, idx in enumerate(SAMPLE_IDXS):
         if j == 0:
             ax.legend(fontsize=7)
 
-    # Pump Level panel: this model DOES predict it (same convention as GORMPO+Chronos --
-    # all 12 channels tokenized/predicted uniformly, see train_gormpo_chronos.py's
-    # docstring for why that convention exists), drawn the same as every other panel,
-    # just labeled secondary since it's not the point of the model.
+    # Pump Level panel: the *given* future action (see split_action_channel), not
+    # forecasted -- no "prediction" line, since the model has nothing of its own to
+    # show here; only context history + the actual chosen action it was conditioned on.
     ax = axes[11]
     j = 11
     ax.plot(t_ctx, ctx_phys[j], color="steelblue", marker="o", markersize=3, label="context")
-    ax.plot(t_pred, y_true[j], color="green", marker="o", markersize=3, linestyle="--", label="ground truth")
-    ax.plot(t_pred, pred_phys[j], color="tomato", marker="o", markersize=3, label="prediction")
+    ax.plot(t_pred, y_orig_full[j], color="black", marker="s", markersize=3, label="given action")
     ax.axvline(0, color="gray", linestyle=":", linewidth=0.8)
     ax.set_ylim(*YLIMS[FEATURE_NAMES[11]])
-    ax.set_title(f"{FEATURE_NAMES[11]} (secondary -- action, not the forecast target)", fontsize=9)
+    ax.set_title(f"{FEATURE_NAMES[11]} (given action, not forecasted)", fontsize=9)
     ax.set_xlabel("time (min)", fontsize=8)
     ax.tick_params(labelsize=7)
     ax.legend(fontsize=7)

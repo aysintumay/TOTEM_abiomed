@@ -25,19 +25,21 @@ from lib.models.metrics import dtw, pearsoncor  # noqa: E402
 def compute_channel_bounds(data_root, low_pct=1, high_pct=99):
     """Per-channel (low, high) physical-unit clipping bounds from the train split's raw
     values -- same role/reasoning as eval_gormpo_chronos.py's compute_variable_ylims-
-    style bound (and gormpo_world_model.py's compute_variable_ylims): nothing in the
-    GORMPO tokenizer's decoder inherently bounds its output, and a bad shape-code
-    prediction can decode to a physically impossible value (observed here too: SYSTOLIC/
-    PULSAT MSE of 24/36 vs. everything else under 0.5) that dominates an MSE average."""
+    style bound (and gormpo_world_model.py's compute_variable_ylims, though that one's
+    equivalent clip has since been removed now that the root cause -- 2 corrupted
+    training timesteps poisoning the tokenizer's q_mu/q_sigma bins, see
+    impute_outliers_and_save.py -- is fixed at the data/tokenizer level instead of
+    papered over here). Sliced to the 11 forecasted channels only -- Pump Level (raw
+    column 12) is the given action now, not one of inference()'s outputs."""
     x_orig = np.load(f"{data_root}/train_x_original.npy")  # (E, patch_len, 12)
-    flat = x_orig.reshape(-1, x_orig.shape[-1])
+    flat = x_orig.reshape(-1, x_orig.shape[-1])[:, :11]
     low = np.percentile(flat, low_pct, axis=0)
     high = np.percentile(flat, high_pct, axis=0)
     return torch.tensor(low, dtype=torch.float32), torch.tensor(high, dtype=torch.float32)
 
 FEATURE_NAMES = [
     "PumpPressure", "PumpSpeed", "PumpFlow", "LVP", "LVEDP", "SYSTOLIC",
-    "DIASTOLIC", "PULSAT", "PumpCurrent", "Heart Rate", "ESE_lv", "Pump Level",
+    "DIASTOLIC", "PULSAT", "PumpCurrent", "Heart Rate", "ESE_lv",
 ]
 
 
@@ -60,8 +62,8 @@ def main(args):
     if not isinstance(mean, torch.Tensor):
         mean = torch.tensor(mean, dtype=torch.float32)
         std = torch.tensor(std, dtype=torch.float32)
-    columns = [i for i in range(13) if i != 11]  # matches FEATURE_NAMES order project-wide
-    m, s = mean[columns].to(device), std[columns].to(device)  # (12,)
+    columns = [i for i in range(13) if i != 11][:11]  # 11 forecasted channels; Pump Level excluded
+    m, s = mean[columns].to(device), std[columns].to(device)  # (11,)
 
     bound_low, bound_high = compute_channel_bounds(args.data_root)
     bound_low, bound_high = bound_low.to(device), bound_high.to(device)
@@ -71,12 +73,12 @@ def main(args):
     all_pred, all_true = [], []
     with torch.no_grad():
         for data_batch in dataloaders["test"]:
-            pred_time, labels_time = inference(data_batch, model, tokenizer, device)  # (B, patch_len, 12) physical
+            pred_time, labels_time = inference(data_batch, model, tokenizer, device)  # (B, patch_len, 11) physical
             pred_time = torch.clamp(pred_time, bound_low, bound_high)
             all_pred.append(((pred_time - m) / s).cpu())
             all_true.append(((labels_time - m) / s).cpu())
 
-    pred = torch.cat(all_pred, dim=0)  # (N, patch_len, 12)
+    pred = torch.cat(all_pred, dim=0)  # (N, patch_len, 11)
     true = torch.cat(all_true, dim=0)
     print(f"Evaluated on {pred.shape[0]} test episodes (full test set)")
 
@@ -96,11 +98,7 @@ def main(args):
         print(f"  {FEATURE_NAMES[j]:<14} MAE={mae[j]:7.4f}  MSE={mse[j]:7.4f}  DTW={dtw_dist[j]:7.4f}  corr={corr[j]:7.4f}")
     print(
         f"\nOverall (mean across 11 forecast variables): "
-        f"MAE={mae[:11].mean():.4f}  MSE={mse[:11].mean():.4f}  DTW={dtw_dist[:11].mean():.4f}  corr={corr[:11].mean():.4f}"
-    )
-    print(
-        f"\n[secondary] Pump Level (channel 12, predicted but not a forecast target): "
-        f"MAE={mae[11]:7.4f}  MSE={mse[11]:7.4f}  DTW={dtw_dist[11]:7.4f}  corr={corr[11]:7.4f}"
+        f"MAE={mae.mean():.4f}  MSE={mse.mean():.4f}  DTW={dtw_dist.mean():.4f}  corr={corr.mean():.4f}"
     )
 
 
