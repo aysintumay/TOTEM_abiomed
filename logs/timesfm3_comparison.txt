@@ -1,0 +1,9 @@
+P-change episodes: 508
+model                            MAE     MSE     DTW    corr  MAE Pchg PSpd Pchg MAE step1   step6
+Carry-forward                 0.1844  0.1152  1.1065  0.0000    0.3219    0.3702    0.1071  0.2374
+Chronos-2 zero-shot           0.1874  0.1186  1.1203  0.0430    0.3207    0.3546    0.1115  0.2382
+Chronos-2 FT global norm      0.1741  0.0960  1.0343  0.0892    0.2696    0.1340    0.1082  0.2189
+Transformer                   0.2042  0.1074  1.1942  0.0820    0.2716    0.0791    0.1506  0.2469
+TimesFM3 native, pad none     0.2402  6.9899  1.4237  0.0117    0.3738    0.3614    0.1211  0.3253
+TimesFM3 native, pad edge     0.2270  0.1879  1.3456  0.0202    0.3680    0.3481    0.1208  0.3137
+TimesFM3 no-norm, pad none    0.5386183.9135  3.1859 -0.0220    0.8287    0.3800    0.1912  0.8314

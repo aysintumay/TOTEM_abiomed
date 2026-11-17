@@ -1,0 +1,37 @@
+| [Val] mse 45694.6172 mae 82.3330 corr -0.0087 dtw 493.7960
+| [Test] mse 44949.4961 mae 82.0065 corr -0.0041 dtw 491.8379
+Early stopping counter is: 0
+| [Val] mse 12772.2324 mae 31.5577 corr -0.0065 dtw 188.4936
+| [Test] mse 12387.2578 mae 31.2844 corr -0.0064 dtw 186.8555
+Early stopping counter is: 0
+| [Val] mse 2204.3176 mae 11.5982 corr 0.0230 dtw 68.1904
+| [Test] mse 2307.2559 mae 11.6618 corr 0.0267 dtw 68.5396
+Early stopping counter is: 0
+| [Val] mse 2328.0774 mae 11.8153 corr 0.0346 dtw 69.3101
+| [Test] mse 2310.5066 mae 11.7162 corr 0.0340 dtw 68.7855
+Early stopping counter is: 1
+| [Val] mse 2273.8132 mae 11.4759 corr 0.0456 dtw 67.2661
+| [Test] mse 2345.0669 mae 11.5073 corr 0.0425 dtw 67.4826
+Early stopping counter is: 0
+| [Val] mse 1975.8689 mae 10.8581 corr 0.0439 dtw 63.6759
+| [Test] mse 2064.5994 mae 10.9561 corr 0.0408 dtw 64.2757
+Early stopping counter is: 0
+| [Val] mse 1724.1989 mae 10.6137 corr 0.0413 dtw 62.1936
+| [Test] mse 1865.5569 mae 10.7614 corr 0.0356 dtw 63.0453
+Early stopping counter is: 0
+| [Val] mse 2201.2051 mae 11.9265 corr 0.0339 dtw 70.1969
+| [Test] mse 2237.2000 mae 11.8188 corr 0.0319 dtw 69.4866
+Early stopping counter is: 1
+| [Val] mse 2163.4509 mae 12.0245 corr 0.0324 dtw 70.7793
+| [Test] mse 2182.1440 mae 11.9548 corr 0.0364 dtw 70.2875
+Early stopping counter is: 2
+| [Val] mse 1990.1891 mae 11.6911 corr 0.0240 dtw 68.9880
+| [Test] mse 2030.1361 mae 11.6642 corr 0.0219 dtw 68.8299
+Early stopping counter is: 3
+| [Val] mse 2192.3489 mae 12.8987 corr 0.0232 dtw 76.0939
+| [Test] mse 2300.8489 mae 12.9358 corr 0.0234 dtw 76.3326
+Early stopping counter is: 4
+| [Val] mse 2205.0605 mae 12.7302 corr 0.0251 dtw 75.1256
+| [Test] mse 2214.9390 mae 12.7094 corr 0.0248 dtw 75.0290
+Early stopping counter is: 5
+Early stopping....

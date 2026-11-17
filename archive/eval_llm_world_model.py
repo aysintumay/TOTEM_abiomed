@@ -27,6 +27,7 @@ from lib.models.metrics import dtw, pearsoncor  # noqa: E402
 def main(args):
     model = FewShotDigitTokenWorldModel(
         k_shot=args.k_shot,
+        mcs_context=args.mcs_context,
         model_id=args.model_id,
         num_features=12,
         forecast_horizon=6,
@@ -34,6 +35,7 @@ def main(args):
         temperature=args.temperature,
         device=args.device,
         load_in_4bit=args.load_in_4bit,
+        max_memory=({i: f"{g}GiB" for i, g in enumerate(args.max_memory_gb)} if args.max_memory_gb else None),
     )
     model.load_data(args.data_path)
 
@@ -110,6 +112,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--data_path", type=str, default="/public/gormpo/10min_1hr_all_data.pkl")
     parser.add_argument("--k_shot", type=int, default=0, help="0 = zero-shot, >0 = k-shot in-context retrieval")
+    parser.add_argument("--mcs_context", action="store_true",
+                        help="append mcs.md's clinical sections (state variables, action space, physiology, "
+                             "weaning logic) to the system prompt; tokenizer and everything else unchanged")
     parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--num_examples", type=int, default=20)
@@ -118,6 +123,8 @@ if __name__ == "__main__":
     parser.add_argument("--random_seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
+    parser.add_argument("--max_memory_gb", type=float, nargs="+", default=None,
+                        help="per visible GPU cap (GiB) for weight placement, e.g. 13 4 -- for shared GPUs")
     parser.add_argument("--shard_id", type=int, default=0, help="this process's shard index, 0-based")
     parser.add_argument("--num_shards", type=int, default=1, help="total shards splitting --num_examples across parallel processes")
     parser.add_argument("--output_npz", type=str, default="", help="save raw (pred, true) arrays here for merge_shards.py")

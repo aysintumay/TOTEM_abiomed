@@ -77,6 +77,7 @@ class LLMWorldModel:
         temperature: float = 0.8,
         device: str = "auto",
         load_in_4bit: bool = False,
+        max_memory: dict | None = None,
     ):
         self.num_features     = num_features
         self.forecast_horizon = forecast_horizon
@@ -94,7 +95,12 @@ class LLMWorldModel:
         print(f"Loading tokenizer: {model_id}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        model_kwargs = {"dtype": torch.bfloat16, "device_map": device}
+        import transformers
+        _dtype_key = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 or \
+            tuple(map(int, transformers.__version__.split(".")[:2])) >= (4, 56) else "torch_dtype"
+        model_kwargs = {_dtype_key: torch.bfloat16, "device_map": device}
+        if max_memory:
+            model_kwargs["max_memory"] = max_memory  # per-GPU cap for device_map="auto" on shared GPUs
         if load_in_4bit:
             from transformers import BitsAndBytesConfig
             model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -427,6 +433,21 @@ class DigitTokenWorldModel(LLMWorldModel):
     Values within a row are separated by ' | '; rows are newline-separated.
     """
 
+    # Opt-in: append mcs.md's clinical sections to the system prompt. Only the
+    # domain-knowledge sections -- the codebase/interface/GORMPO-tokenization/eval
+    # sections don't apply to digit tokens. Isolates "does clinical context help?"
+    # with the tokenizer held fixed.
+    mcs_context: bool = False
+    _MCS_SECTIONS = ("## State variables", "## Action space", "## Impella physiology", "## Weaning logic")
+
+    def _mcs_clinical_context(self) -> str:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcs.md"), "r") as f:
+            text = f.read()
+        sections = re.split(r"(?m)^(?=## )", text)
+        kept = [re.sub(r"(?m)^---\s*$", "", sec).strip() for sec in sections if sec.startswith(self._MCS_SECTIONS)]
+        assert len(kept) == len(self._MCS_SECTIONS), "mcs.md section headings changed"
+        return "\n\n".join(kept)
+
     # ── value encoding / decoding ─────────────────────────────────────────────
 
     def _encode_value(self, v: float) -> str:
@@ -508,7 +529,12 @@ class DigitTokenWorldModel(LLMWorldModel):
             "PumpPressure ≥ 60 mmHg  |  LVEDP < 18 mmHg  |  PULSAT ≥ 20 mmHg  "
             "|  Heart Rate 50–100 bpm  |  SYSTOLIC 90–130 mmHg\n\n"
             "Weaning goal: reduce Pump Level gradually while hemodynamics stay stable.\n\n"
-            "=== TASK ===\n"
+            + (
+                "=== CLINICAL CONTEXT (physical units; the values you see are z-scored) ===\n"
+                f"{self._mcs_clinical_context()}\n\n"
+                if self.mcs_context else ""
+            )
+            + "=== TASK ===\n"
             f"You receive {self.forecast_horizon} rows of context "
             f"(one row per 10-min timestep, 12 digit-token values separated by ' | ').\n"
             f"Predict the next {self.forecast_horizon} timesteps in the SAME format: "
@@ -619,9 +645,10 @@ class FewShotDigitTokenWorldModel(DigitTokenWorldModel):
     all values encoded as digit tokens in normalized space.
     """
 
-    def __init__(self, k_shot: int = 5, **kwargs):
+    def __init__(self, k_shot: int = 5, mcs_context: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.k_shot = k_shot
+        self.mcs_context = mcs_context
         self._train_last_norm = None   # (N, 12) last context state, normalized
         self._train_ctx_norm  = None   # (N, T, 12) full context, normalized
         self._train_fc_norm   = None   # (N, T, 12) forecast incl. PL, normalized

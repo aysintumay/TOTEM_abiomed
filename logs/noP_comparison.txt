@@ -1,0 +1,14 @@
+
+== all 500 (n=500) MAE z-score ==
+  model                     all 11    PumpSpeed     PumpFlow  PumpCurrent   dir-correct  |move| (PumpSpeed RPM)
+  Carry-forward             0.1863       0.0464       0.0856       0.0597
+  revised ctx, (t7, P7)     0.2240       0.0714       0.1148       0.0840
+  revised ctx, (t7, 7)      0.2234       0.0637       0.1134       0.0791
+
+== Pump Level changes (n=68) MAE z-score ==
+  model                     all 11    PumpSpeed     PumpFlow  PumpCurrent   dir-correct  |move| (PumpSpeed RPM)
+  Carry-forward             0.2978       0.3231       0.2995       0.3063         19%       0
+  revised ctx, (t7, P7)     0.3530       0.3699       0.3706       0.3670         54%      40
+  revised ctx, (t7, 7)      0.3387       0.3557       0.3538       0.3500         63%      62
+true mean |move| PumpSpeed on P-change: 258.0
+fallbacks: 0 vs 1
