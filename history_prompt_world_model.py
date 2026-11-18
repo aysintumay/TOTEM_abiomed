@@ -84,7 +84,12 @@ class HistoryPromptWorldModel(LLMWorldModel):
     def __init__(self, model_id: str = "m42-health/Llama3-Med42-8B", num_samples: int = 1,
                  temperature: float = 0.0, mcs_context: bool = True,
                  context_file: str | None = None, context_sections: list | None = None,
-                 pl_prefix: bool = True, **kwargs):
+                 pl_prefix: bool = True, compact_prompt: bool = False, **kwargs):
+        # compact_prompt=True (fewer tokens, same information): history values as a plain
+        # comma list "PumpSpeed (RPM): 4199,4199,...,4200" instead of "(t1, 4199), ..." pairs;
+        # the answer format is described once instead of an 11-line template; the requested
+        # answer is "Name: v7,...,v12" (no brackets/spaces). _parse reads both formats.
+        self.compact_prompt = compact_prompt
         # pl_prefix=False writes the planned Pump Level as plain numbers "(t7, 7)" -- the same
         # format as the Pump Level history line -- instead of "(t7, P7)".
         self.pl_prefix = pl_prefix
@@ -129,6 +134,8 @@ class HistoryPromptWorldModel(LLMWorldModel):
         )
 
     def _build_prompt(self, ctx_phys: np.ndarray, pl_seq: list) -> str:
+        if self.compact_prompt:
+            return self._build_compact_prompt(ctx_phys, pl_seq)
         T, H = ctx_phys.shape[0], len(pl_seq)
         hist = "\n".join(
             (f"  {name} - {VAR_DESC[name]}: " if self.mcs_context and self.context_text is None
@@ -155,6 +162,31 @@ class HistoryPromptWorldModel(LLMWorldModel):
             f"Task: Predict the values of the {self.n_targets} variables below for the next {H} "
             f"timestamps (t{T + 1}-t{T + H}). Respond with exactly one line per variable, in this "
             f"format, replacing each x with a number:\n{template}")
+        )
+
+    def _build_compact_prompt(self, ctx_phys: np.ndarray, pl_seq: list) -> str:
+        T, H = ctx_phys.shape[0], len(pl_seq)
+        hist = "\n".join(
+            (f"  {name} - {VAR_DESC[name]}: " if self.mcs_context and self.context_text is None
+             else f"  {name} ({UNITS[name]}): ")
+            + ",".join(self._fmt(name, ctx_phys[t, j]) for t in range(T))
+            for j, name in enumerate(FEATURE_NAMES)
+        )
+        pre = "P" if self.pl_prefix else ""
+        plan = ", ".join(f"(t{T + h + 1}, {pre}{p})" for h, p in enumerate(pl_seq))
+        order = ", ".join(FEATURE_NAMES[: self.n_targets])
+        return (
+            f"Metadata: This multivariate time series records the hemodynamic state of an ICU "
+            f"patient on Impella mechanical circulatory support, with a collection frequency of "
+            f"10 minutes. Prediction target period: from t{T + 1} to t{T + H}.\n"
+            f"History: the patient's last {T} timesteps (t1-t{T}, oldest first), comma-separated:\n"
+            f"{hist}\n"
+            f"Covariates: Pump Level in the prediction window: {plan}.\n"
+            + (f"Context:\n{self.context_text}\n" if self.context_text is not None
+               else f"Context:\n{MCS_CONTEXT}\n" if self.mcs_context else "")
+            + f"Task: Predict t{T + 1}-t{T + H} for these {self.n_targets} variables: {order}. "
+            f"Respond with exactly one line per variable, in that order, formatted as "
+            f"Name: v{T + 1},v{T + 2},...,v{T + H} ({H} comma-separated numbers)."
         )
 
     # ── generation / parsing ──────────────────────────────────────────────────

@@ -32,6 +32,7 @@ def main(args):
         context_file=args.context_file or None,
         context_sections=args.context_sections,
         pl_prefix=not args.no_pl_prefix,
+        compact_prompt=args.compact_prompt,
         device=args.device,
         load_in_4bit=args.load_in_4bit,
         max_memory=({i: f"{g}GiB" for i, g in enumerate(args.max_memory_gb)} if args.max_memory_gb else None),
@@ -125,5 +126,7 @@ if __name__ == "__main__":
                    help="subset of '## ' section names from --context_file (default: all)")
     p.add_argument("--no_pl_prefix", action="store_true",
                    help='write the planned Pump Level as "(t7, 7)" instead of "(t7, P7)"')
+    p.add_argument("--compact_prompt", action="store_true",
+                   help="plain comma-list history, one-sentence answer format (fewer tokens)")
     p.add_argument("--print_prompt", action="store_true", help="print one full prompt + raw response")
     main(p.parse_args())
