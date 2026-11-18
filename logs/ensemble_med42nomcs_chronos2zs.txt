@@ -1,0 +1,50 @@
+Saved Chronos-2 predictions to logs/chronos2_zeroshot_test_preds.npz
+Ground-truth alignment: max |diff| = 9.54e-07, mean = 1.27e-07 (z-score units)
+
+=== Chronos-2 (amazon/chronos-2): per-variable MAE / MSE / DTW / Pearson corr (z-score units) ===
+  PumpPressure   MAE= 0.3186  MSE= 0.2423  DTW= 1.9050  corr= 0.0531
+  PumpSpeed      MAE= 0.0537  MSE= 0.0435  DTW= 0.3215  corr= 0.0287
+  PumpFlow       MAE= 0.0924  MSE= 0.0444  DTW= 0.5519  corr= 0.0544
+  LVP            MAE= 0.2071  MSE= 0.1226  DTW= 1.2376  corr= 0.0480
+  LVEDP          MAE= 0.1858  MSE= 0.1140  DTW= 1.1111  corr= 0.0417
+  SYSTOLIC       MAE= 0.2990  MSE= 0.2169  DTW= 1.7876  corr= 0.0560
+  DIASTOLIC      MAE= 0.2697  MSE= 0.1759  DTW= 1.6128  corr= 0.0527
+  PULSAT         MAE= 0.1919  MSE= 0.1031  DTW= 1.1473  corr= 0.0449
+  PumpCurrent    MAE= 0.0662  MSE= 0.0390  DTW= 0.3953  corr= 0.0482
+  Heart Rate     MAE= 0.1553  MSE= 0.0852  DTW= 0.9289  corr= 0.0112
+  ESE_lv         MAE= 0.2215  MSE= 0.1176  DTW= 1.3243  corr= 0.0335
+Overall: MAE=0.1874  MSE=0.1186  DTW=1.1203  corr=0.0430
+
+=== LLM (logs/med42_history_prompt_nomcs.npz): per-variable MAE / MSE / DTW / Pearson corr (z-score units) ===
+  PumpPressure   MAE= 0.3767  MSE= 0.2988  DTW= 2.1315  corr=-0.0414
+  PumpSpeed      MAE= 0.0754  MSE= 0.0631  DTW= 0.4476  corr= 0.0311
+  PumpFlow       MAE= 0.1225  MSE= 0.0652  DTW= 0.7098  corr=-0.0038
+  LVP            MAE= 0.2523  MSE= 0.1683  DTW= 1.4298  corr=-0.0487
+  LVEDP          MAE= 0.2263  MSE= 0.1561  DTW= 1.2915  corr=-0.0429
+  SYSTOLIC       MAE= 0.3652  MSE= 0.2913  DTW= 2.0668  corr=-0.0460
+  DIASTOLIC      MAE= 0.3488  MSE= 0.2653  DTW= 1.9699  corr=-0.0318
+  PULSAT         MAE= 0.2401  MSE= 0.1412  DTW= 1.3692  corr=-0.0443
+  PumpCurrent    MAE= 0.0908  MSE= 0.0590  DTW= 0.5340  corr=-0.0065
+  Heart Rate     MAE= 0.1956  MSE= 0.1130  DTW= 1.1198  corr= 0.0047
+  ESE_lv         MAE= 0.2724  MSE= 0.1682  DTW= 1.5361  corr=-0.0220
+Overall: MAE=0.2333  MSE=0.1627  DTW=1.3278  corr=-0.0229
+
+=== Ensemble: per-variable MAE / MSE / DTW / Pearson corr (z-score units) ===
+  PumpPressure   MAE= 0.3229  MSE= 0.2290  DTW= 1.8684  corr=-0.0370
+  PumpSpeed      MAE= 0.0611  MSE= 0.0472  DTW= 0.3638  corr= 0.0368
+  PumpFlow       MAE= 0.1012  MSE= 0.0487  DTW= 0.5927  corr= 0.0024
+  LVP            MAE= 0.2156  MSE= 0.1255  DTW= 1.2496  corr=-0.0456
+  LVEDP          MAE= 0.1941  MSE= 0.1175  DTW= 1.1302  corr=-0.0374
+  SYSTOLIC       MAE= 0.3118  MSE= 0.2190  DTW= 1.8041  corr=-0.0421
+  DIASTOLIC      MAE= 0.2884  MSE= 0.1860  DTW= 1.6656  corr=-0.0278
+  PULSAT         MAE= 0.2017  MSE= 0.1036  DTW= 1.1722  corr=-0.0393
+  PumpCurrent    MAE= 0.0740  MSE= 0.0435  DTW= 0.4374  corr= 0.0050
+  Heart Rate     MAE= 0.1660  MSE= 0.0883  DTW= 0.9681  corr= 0.0062
+  ESE_lv         MAE= 0.2326  MSE= 0.1246  DTW= 1.3426  corr=-0.0201
+Overall: MAE=0.1972  MSE=0.1212  DTW=1.1450  corr=-0.0181
+
+=== Summary (overall, z-score units) ===
+  model                                        MAE     MSE     DTW    corr
+  Chronos-2                                 0.1874  0.1186  1.1203  0.0430
+  LLM                                       0.2333  0.1627  1.3278 -0.0229
+  Ensemble 0.5*LLM + 0.5*Chronos-2          0.1972  0.1212  1.1450 -0.0181

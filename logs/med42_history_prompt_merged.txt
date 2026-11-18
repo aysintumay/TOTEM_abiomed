@@ -1,0 +1,21 @@
+Merging 2 shard files:
+  logs/med42_history_prompt_shard0.npz
+  logs/med42_history_prompt_shard1.npz
+
+Combined: 3876 episodes (expected 3876)
+
+=== Per-variable MAE / MSE / DTW / Pearson corr (normalized/z-score units, averaged over all samples) ===
+  PumpPressure   MAE= 0.4097  MSE= 0.3315  DTW= 2.3473  corr=-0.0212
+  PumpSpeed      MAE= 0.0725  MSE= 0.0545  DTW= 0.4291  corr= 0.0567
+  PumpFlow       MAE= 0.1393  MSE= 0.0643  DTW= 0.8146  corr= 0.0312
+  LVP            MAE= 0.2605  MSE= 0.1635  DTW= 1.4941  corr=-0.0276
+  LVEDP          MAE= 0.2362  MSE= 0.1483  DTW= 1.3677  corr=-0.0157
+  SYSTOLIC       MAE= 0.3644  MSE= 0.2794  DTW= 2.0850  corr=-0.0257
+  DIASTOLIC      MAE= 0.3524  MSE= 0.2669  DTW= 2.0066  corr=-0.0087
+  PULSAT         MAE= 0.2644  MSE= 0.1710  DTW= 1.5252  corr=-0.0246
+  PumpCurrent    MAE= 0.0887  MSE= 0.0490  DTW= 0.5218  corr= 0.0308
+  Heart Rate     MAE= 0.1930  MSE= 0.1074  DTW= 1.1098  corr= 0.0035
+  ESE_lv         MAE= 0.2810  MSE= 0.1726  DTW= 1.6073  corr=-0.0053
+
+Overall (mean across all 11 variables): MAE=0.2420  MSE=0.1644  DTW=1.3917  corr=-0.0006
+Fallback rate: 2/3876 examples had all samples unparseable

@@ -3,7 +3,7 @@
 *.log
 *.sql
 *.sqlite
- 
+figures/
 # OS generated files #
 ######################
 .DS_Store?
@@ -97,3 +97,7 @@ figures/
 !forecasting/data/gormpo_tokens_mcs_scratch_long2000/**
 !forecasting/results_llm/gormpo_mcs_scratch_long2000/
 !forecasting/results_llm/gormpo_mcs_scratch_long2000/gormpo_llm_2021.txt
+
+# regenerable with archive/prepare_chronos_native_data.py
+chronos_gluonts_data/
+*.pid
